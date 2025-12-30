@@ -1,22 +1,29 @@
 #!/bin/bash
-# Vishwarupa - Phone/Tablet Startup Script
-
 echo "🌐 Starting Vishwarupa on Phone/Tablet..."
 echo ""
 
-# Create master key if doesn't exist
 if [ ! -f "master_9000.key" ]; then
     echo "Creating master key..."
     echo "0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef" > master_9000.key
 fi
 
-# Start Python server in background
 echo "Starting web server on port 8000..."
 python server.py &
 SERVER_PID=$!
-sleep 2
 
-# Start Rust agent
+# Wait for server to be fully ready
+echo "Waiting for server to start..."
+sleep 5
+
+# Verify server is responding
+for i in {1..10}; do
+    if curl -s http://localhost:8000 > /dev/null 2>&1; then
+        echo "Server is ready!"
+        break
+    fi
+    sleep 1
+done
+
 echo "Starting agent on port 9000..."
 export LISTEN_PORT=9000
 ./target/release/vishwarupa &
@@ -37,7 +44,5 @@ echo ""
 echo "Press Ctrl+C to stop..."
 echo ""
 
-# Wait for Ctrl+C
 trap "echo ''; echo 'Stopping...'; kill $SERVER_PID $AGENT_PID 2>/dev/null; exit" INT TERM
 wait
-
