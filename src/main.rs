@@ -504,6 +504,27 @@ async fn upload(path: &str, db: Arc<Database>) -> Result<String> {
     };
 
     db.store_manifest(&manifest)?;
+    
+    // Send manifest to server so all devices can see it
+    let manifest_json = serde_json::to_string(&manifest)?;
+    let client = reqwest::blocking::Client::new();
+    
+    #[derive(Serialize)]
+    struct ManifestRequest {
+        file_id: String,
+        manifest: String,
+    }
+    
+    let request = ManifestRequest {
+        file_id: manifest.file_id.clone(),
+        manifest: manifest_json,
+    };
+    
+    match client.post("http://127.0.0.1:8000/manifest").json(&request).send() {
+        Ok(_) => println!("✓ Manifest sent to server"),
+        Err(e) => eprintln!("⚠ Failed to send manifest to server: {}", e),
+    }
+    
     println!("\n✓ Upload complete!");
     println!("  File ID: {}", file_id);
     println!("  Shards stored: {}", shard_count);
