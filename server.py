@@ -173,11 +173,18 @@ async def web_upload(file: UploadFile = File(...)):
         env = os.environ.copy()
         env['LISTEN_PORT'] = '9999'
         
+        # Find vishwarupa binary
+        import shutil
+        vishwarupa_path = shutil.which('vishwarupa') or './target/release/vishwarupa'
+        if os.name == 'nt':
+            vishwarupa_path = 'target\\release\\vishwarupa.exe'
+        
         result = subprocess.run(
-            ['target/release/vishwarupa.exe' if os.name == 'nt' else 'target/release/vishwarupa', 'upload', tmp_path],
+            [vishwarupa_path, 'upload', tmp_path],
             capture_output=True,
             text=True,
-            env=env
+            env=env,
+            cwd=os.path.dirname(os.path.abspath(__file__))
         )
         
         # Clean up temp file
@@ -220,11 +227,18 @@ async def web_download(file_id: str):
         env = os.environ.copy()
         env['LISTEN_PORT'] = '9999'
         
+        # Find vishwarupa binary
+        import shutil
+        vishwarupa_path = shutil.which('vishwarupa') or './target/release/vishwarupa'
+        if os.name == 'nt':
+            vishwarupa_path = 'target\\release\\vishwarupa.exe'
+        
         result = subprocess.run(
-            ['target/release/vishwarupa.exe' if os.name == 'nt' else 'target/release/vishwarupa', 'download', file_id, tmp_path],
+            [vishwarupa_path, 'download', file_id, tmp_path],
             capture_output=True,
             text=True,
-            env=env
+            env=env,
+            cwd=os.path.dirname(os.path.abspath(__file__))
         )
         
         if result.returncode == 0 and os.path.exists(tmp_path):
