@@ -1,72 +1,157 @@
 @echo off
-REM Vishwarupa Quick Start Script for Windows
+setlocal EnableDelayedExpansion
+chcp 65001 >nul 2>&1
 
-echo ========================================
-echo Vishwarupa - Decentralized Personal Storage
-echo ========================================
+echo.
+echo ╔═══════════════════════════════════════════════════════════╗
+echo ║           VISHWARUPA - Distributed Storage                ║
+echo ║                                                           ║
+echo ║   Works on: Phone, Laptop, Tablet, Server - Any Device!  ║
+echo ╚═══════════════════════════════════════════════════════════╝
 echo.
 
-REM Check if Python is installed
-python --version >nul 2>&1
-if errorlevel 1 (
-    echo [X] Python 3 is not installed. Please install Python 3.11+
+cd /d "%~dp0"
+echo Working directory: %CD%
+
+REM Get local IP
+for /f "tokens=2 delims=:" %%a in ('ipconfig ^| findstr /c:"IPv4"') do (
+    for /f "tokens=1" %%b in ("%%a") do (
+        if not defined LOCAL_IP set "LOCAL_IP=%%b"
+    )
+)
+REM Trim spaces
+set LOCAL_IP=%LOCAL_IP: =%
+
+if "%LOCAL_IP%"=="" (
+    echo Could not detect IP. Check ipconfig.
+    set /p LOCAL_IP="Enter this device's IP address: "
+)
+
+echo This device's IP: %LOCAL_IP%
+echo.
+
+echo ═══════════════════════════════════════════════════════════
+echo   Choose how to start:
+echo.
+echo   [1] START NEW NETWORK (First device / Hub)
+echo       - This device will host the web UI
+echo       - Other devices will connect to this one
+echo.
+echo   [2] JOIN EXISTING NETWORK
+echo       - Connect to another device already running
+echo       - You'll need that device's IP address
+echo.
+echo ═══════════════════════════════════════════════════════════
+set /p MODE_CHOICE="Enter choice (1 or 2): "
+
+if "%MODE_CHOICE%"=="1" goto START_HUB
+if "%MODE_CHOICE%"=="2" goto JOIN_NETWORK
+
+echo Invalid choice. Defaulting to [1]...
+goto START_HUB
+
+:START_HUB
+echo.
+echo Starting as NETWORK HUB...
+
+set SERVER_URL=http://127.0.0.1:8000
+set LISTEN_PORT=9000
+
+REM Check if agent exists
+if exist "target\release\vishwarupa.exe" (
+    set AGENT=target\release\vishwarupa.exe
+) else (
+    echo Building agent (first time only)...
+    cargo build --release
+    set AGENT=target\release\vishwarupa.exe
+)
+
+echo.
+echo Starting web server in new window...
+start "Vishwarupa Server" cmd /c "python server.py"
+
+timeout /t 3 /nobreak >nul
+
+echo Starting agent in new window...
+start "Vishwarupa Agent" cmd /k "%AGENT%"
+
+timeout /t 2 /nobreak >nul
+
+echo.
+echo ╔═══════════════════════════════════════════════════════════╗
+echo ║              VISHWARUPA IS RUNNING                        ║
+echo ╠═══════════════════════════════════════════════════════════╣
+echo ║                                                           ║
+echo ║  Open this URL on ANY device:                             ║
+echo ║                                                           ║
+echo ║     http://%LOCAL_IP%:8000
+echo ║                                                           ║
+echo ║  To add more devices, run on each device:                 ║
+echo ║     ./start.sh or start.bat                               ║
+echo ║     Choose [2] then enter: %LOCAL_IP%
+echo ║                                                           ║
+echo ║  Features: Upload, Download, Stream Video, Share          ║
+echo ║                                                           ║
+echo ╚═══════════════════════════════════════════════════════════╝
+echo.
+echo Close this window to stop, or close the Server/Agent windows.
+pause
+goto END
+
+:JOIN_NETWORK
+echo.
+set /p HUB_IP="Enter the IP of the device running Vishwarupa: "
+
+if "%HUB_IP%"=="" (
+    echo Hub IP is required!
+    pause
     exit /b 1
 )
 
-REM Check if Rust is installed
-cargo --version >nul 2>&1
-if errorlevel 1 (
-    echo [X] Rust is not installed. Install from https://rustup.rs
-    exit /b 1
+echo Testing connection to http://%HUB_IP%:8000...
+curl -s --connect-timeout 5 "http://%HUB_IP%:8000/" >nul 2>&1
+if %ERRORLEVEL% EQU 0 (
+    echo Connected!
+) else (
+    echo Warning: Could not reach http://%HUB_IP%:8000
+    echo Make sure the hub device is running and on the same network.
+    set /p CONTINUE="Continue anyway? (y/n): "
+    if /i not "!CONTINUE!"=="y" exit /b 1
 )
 
-echo [✓] Python found
-echo [✓] Rust found
-echo.
+set SERVER_URL=http://%HUB_IP%:8000
+set LISTEN_PORT=9000
 
-REM Install Python dependencies
-if not exist "venv" (
-    echo Creating virtual environment...
-    python -m venv venv
-)
-
-echo Installing Python dependencies...
-call venv\Scripts\activate.bat
-pip install -q -r requirements.txt
-
-REM Build Rust agent
-echo.
-echo Building agent...
-cargo build --release
-
-if errorlevel 1 (
-    echo [X] Build failed
-    exit /b 1
+REM Check if agent exists
+if exist "target\release\vishwarupa.exe" (
+    set AGENT=target\release\vishwarupa.exe
+) else (
+    echo Building agent (first time only)...
+    cargo build --release
+    set AGENT=target\release\vishwarupa.exe
 )
 
 echo.
-echo [✓] Build complete!
-echo.
-echo ========================================
-echo Next Steps:
-echo ========================================
-echo.
-echo 1. Start the controller (in Command Prompt 1):
-echo    venv\Scripts\uvicorn server:app --host 0.0.0.0 --port 8000
-echo.
-echo 2. Open browser:
-echo    http://localhost:8000
-echo.
-echo 3. Run agent daemon (in Command Prompt 2):
-echo    target\release\agent.exe
-echo.
-echo 4. Run agents on other devices, then upload:
-echo    target\release\agent.exe upload myfile.pdf
-echo.
-echo 5. Download on any device:
-echo    target\release\agent.exe download [file_id] output.pdf
-echo.
-echo ========================================
+echo Starting agent...
+start "Vishwarupa Agent" cmd /k "set LOCAL_IP=%LOCAL_IP%&& set SERVER_URL=%SERVER_URL%&& set LISTEN_PORT=9000&& %AGENT%"
 
+timeout /t 2 /nobreak >nul
+
+echo.
+echo ╔═══════════════════════════════════════════════════════════╗
+echo ║              JOINED THE NETWORK                           ║
+echo ╠═══════════════════════════════════════════════════════════╣
+echo ║                                                           ║
+echo ║  Open this URL on ANY device:                             ║
+echo ║                                                           ║
+echo ║     http://%HUB_IP%:8000
+echo ║                                                           ║
+echo ║  This device is now storing shards                        ║
+echo ║  Files uploaded will be distributed here too              ║
+echo ║                                                           ║
+echo ╚═══════════════════════════════════════════════════════════╝
+echo.
 pause
 
+:END
+endlocal
