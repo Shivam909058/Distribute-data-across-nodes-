@@ -249,6 +249,52 @@ def get_devices():
     
     return {"devices": devices}
 
+@app.get("/api/stats")
+def get_stats():
+    """Get dashboard stats for auto-refresh"""
+    conn = sqlite3.connect(DATABASE_FILE)
+    cursor = conn.cursor()
+    
+    cursor.execute("SELECT COUNT(*) FROM devices")
+    total_devices = cursor.fetchone()[0]
+    
+    cursor.execute("SELECT device_id FROM devices")
+    device_ids = [row[0] for row in cursor.fetchall()]
+    timeout = timedelta(minutes=5)
+    now = datetime.now()
+    online_devices = sum(1 for did in device_ids if did in device_heartbeats and (now - device_heartbeats[did]) < timeout)
+    
+    cursor.execute("SELECT COUNT(*) FROM manifests")
+    files_count = cursor.fetchone()[0]
+    
+    cursor.execute("SELECT file_id, manifest, uploaded_at FROM manifests ORDER BY uploaded_at DESC LIMIT 50")
+    files_rows = cursor.fetchall()
+    
+    conn.close()
+    
+    files = []
+    for row in files_rows:
+        file_id, manifest_str, uploaded_at = row
+        try:
+            manifest = json.loads(manifest_str)
+            files.append({
+                "file_id": file_id,
+                "name": manifest.get("original_name", "unknown"),
+                "size": manifest.get("file_size", 0),
+                "uploaded_at": uploaded_at,
+                "folder": manifest.get("sync_folder"),
+                "tags": manifest.get("tags", [])
+            })
+        except:
+            pass
+    
+    return {
+        "total_devices": total_devices,
+        "online_devices": online_devices,
+        "files_count": files_count,
+        "files": files
+    }
+
 @app.post("/manifest")
 def store_manifest(m: Manifest):
     conn = sqlite3.connect(DATABASE_FILE)
@@ -428,41 +474,68 @@ def find_vishwarupa_binary():
 @app.post("/upload")
 async def web_upload(file: UploadFile = File(...)):
     """Handle file upload from web UI"""
+    tmp_path = None
     try:
         log_activity("UPLOAD_START", f"Starting upload: {file.filename}", status="info")
         
         # Save uploaded file temporarily
-        with tempfile.NamedTemporaryFile(delete=False, suffix=os.path.splitext(file.filename)[1]) as tmp:
+        suffix = os.path.splitext(file.filename)[1] if file.filename else '.tmp'
+        with tempfile.NamedTemporaryFile(delete=False, suffix=suffix) as tmp:
             content = await file.read()
+            if not content:
+                raise HTTPException(status_code=400, detail="Empty file received")
             tmp.write(content)
             tmp_path = tmp.name
         
         file_size_kb = len(content) / 1024
         log_activity("UPLOAD_SAVED", f"Saved {file.filename} ({file_size_kb:.1f} KB) to temp", status="info")
         
-        # Run vishwarupa upload command
+        # Run vishwarupa upload command with timeout
         env = os.environ.copy()
         env['LISTEN_PORT'] = '9999'
         
         # Find vishwarupa binary
-        vishwarupa_path = find_vishwarupa_binary()
+        try:
+            vishwarupa_path = find_vishwarupa_binary()
+        except FileNotFoundError as e:
+            log_activity("UPLOAD_ERROR", "Binary not found", status="error")
+            raise HTTPException(status_code=500, detail=str(e))
         
         log_activity("UPLOAD_PROCESSING", f"Encrypting and distributing {file.filename}...", status="info")
         
-        result = subprocess.run(
-            [vishwarupa_path, 'upload', tmp_path],
-            capture_output=True,
-            text=True,
-            env=env,
-            cwd=os.path.dirname(os.path.abspath(__file__))
-        )
+        # Use async subprocess with timeout to prevent hanging
+        try:
+            process = await asyncio.create_subprocess_exec(
+                vishwarupa_path, 'upload', tmp_path,
+                stdout=asyncio.subprocess.PIPE,
+                stderr=asyncio.subprocess.PIPE,
+                env=env,
+                cwd=os.path.dirname(os.path.abspath(__file__))
+            )
+            
+            # Wait with timeout (60 seconds for upload)
+            try:
+                stdout, stderr = await asyncio.wait_for(process.communicate(), timeout=60.0)
+                stdout_text = stdout.decode() if stdout else ""
+                stderr_text = stderr.decode() if stderr else ""
+                returncode = process.returncode
+            except asyncio.TimeoutError:
+                process.kill()
+                await process.wait()
+                log_activity("UPLOAD_TIMEOUT", f"Upload timed out for {file.filename}", status="error")
+                raise HTTPException(status_code=504, detail="Upload timed out - check if agents are running")
+        except FileNotFoundError:
+            log_activity("UPLOAD_ERROR", "Binary not found", status="error")
+            raise HTTPException(status_code=500, detail="vishwarupa binary not found")
         
         # Clean up temp file
-        os.unlink(tmp_path)
+        if tmp_path and os.path.exists(tmp_path):
+            os.unlink(tmp_path)
+            tmp_path = None
         
-        if result.returncode == 0:
+        if returncode == 0:
             # Extract file ID from output
-            for line in result.stdout.split('\n'):
+            for line in stdout_text.split('\n'):
                 if 'File ID:' in line:
                     file_id = line.split('File ID:')[1].strip()
                     log_activity("UPLOAD_SUCCESS", f"Uploaded {file.filename} → {file_id[:8]}...", status="success")
@@ -470,10 +543,18 @@ async def web_upload(file: UploadFile = File(...)):
             log_activity("UPLOAD_SUCCESS", f"Uploaded {file.filename}", status="success")
             return {"ok": True, "message": "Upload complete"}
         else:
-            log_activity("UPLOAD_FAILED", f"Failed: {result.stderr[:100]}", status="error")
-            raise HTTPException(status_code=500, detail=result.stderr)
+            error_msg = stderr_text[:200] if stderr_text else "Unknown error"
+            log_activity("UPLOAD_FAILED", f"Failed: {error_msg[:100]}", status="error")
+            raise HTTPException(status_code=500, detail=error_msg)
     
+    except HTTPException:
+        # Re-raise HTTP exceptions as-is
+        if tmp_path and os.path.exists(tmp_path):
+            os.unlink(tmp_path)
+        raise
     except Exception as e:
+        if tmp_path and os.path.exists(tmp_path):
+            os.unlink(tmp_path)
         log_activity("UPLOAD_ERROR", str(e)[:100], status="error")
         raise HTTPException(status_code=500, detail=str(e))
 
@@ -1260,14 +1341,31 @@ def ui():
             
             progressContainer.style.display = 'block';
             progressFill.style.width = '0%';
-            progressText.textContent = 'Uploading...';
+            progressText.textContent = 'Uploading to server...';
+            
+            // Animate progress bar (fake progress for UX)
+            let fakeProgress = 0;
+            const progressInterval = setInterval(() => {{
+                if (fakeProgress < 90) {{
+                    fakeProgress += Math.random() * 10;
+                    progressFill.style.width = Math.min(fakeProgress, 90) + '%';
+                    if (fakeProgress > 30) progressText.textContent = 'Encrypting & distributing...';
+                    if (fakeProgress > 60) progressText.textContent = 'Sending to devices...';
+                }}
+            }}, 500);
             
             try {{
+                const controller = new AbortController();
+                const timeoutId = setTimeout(() => controller.abort(), 120000); // 2 min timeout
+                
                 const response = await fetch('/upload', {{
                     method: 'POST',
-                    body: formData
+                    body: formData,
+                    signal: controller.signal
                 }});
                 
+                clearTimeout(timeoutId);
+                clearInterval(progressInterval);
                 progressFill.style.width = '100%';
                 
                 if (response.ok) {{
@@ -1283,8 +1381,14 @@ def ui():
                     showToast('Upload failed: ' + error);
                 }}
             }} catch (error) {{
-                progressText.textContent = '✗ Upload failed';
-                showToast('Upload failed: ' + error.message);
+                clearInterval(progressInterval);
+                if (error.name === 'AbortError') {{
+                    progressText.textContent = '✗ Upload timed out';
+                    showToast('Upload timed out - check if agents are running');
+                }} else {{
+                    progressText.textContent = '✗ Upload failed';
+                    showToast('Upload failed: ' + error.message);
+                }}
             }}
             
             setTimeout(() => {{
@@ -1412,22 +1516,38 @@ def ui():
             }}, 3000);
         }}
         
+        // Update stats without full page reload
+        async function updateStats() {{
+            try {{
+                const response = await fetch('/api/stats');
+                if (response.ok) {{
+                    const data = await response.json();
+                    // Update stat cards
+                    const statNumbers = document.querySelectorAll('.stat-number');
+                    if (statNumbers.length >= 3) {{
+                        statNumbers[0].textContent = data.total_devices;
+                        statNumbers[1].textContent = data.online_devices;
+                        statNumbers[2].textContent = data.files_count;
+                    }}
+                }}
+            }} catch (e) {{
+                console.log('Stats refresh failed:', e);
+            }}
+        }}
+        
         // Load logs on page load if logs tab is visible
         document.addEventListener('DOMContentLoaded', () => {{
             // Initial log load
             loadLogs();
+            // Initial stats
+            updateStats();
         }});
         
-        // Auto-refresh every 30 seconds (less aggressive)
-        setInterval(() => {{
-            // Only reload if not on logs tab (logs will auto-update separately)
-            const logsTab = document.getElementById('tab-logs');
-            if (!logsTab.classList.contains('active')) {{
-                location.reload();
-            }} else {{
-                loadLogs();
-            }}
-        }}, 30000);
+        // Auto-refresh stats every 5 seconds (lightweight)
+        setInterval(updateStats, 5000);
+        
+        // Auto-refresh logs every 10 seconds
+        setInterval(loadLogs, 10000);
     </script>
 </body>
 </html>

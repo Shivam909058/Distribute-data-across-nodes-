@@ -368,7 +368,58 @@ async fn discover_devices() -> Result<Vec<Device>> {
         }
     }
     
+    // If no devices found via mDNS, try fetching from server
+    if devices.is_empty() {
+        println!("No mDNS devices found, checking server...");
+        if let Ok(server_devices) = fetch_devices_from_server().await {
+            devices = server_devices;
+        }
+    }
+    
     println!("Discovered {} devices", devices.len());
+    Ok(devices)
+}
+
+async fn fetch_devices_from_server() -> Result<Vec<Device>> {
+    let server_url = get_server_url();
+    let client = reqwest::Client::builder()
+        .timeout(std::time::Duration::from_secs(5))
+        .build()?;
+    
+    let response = client
+        .get(format!("{}/devices", server_url))
+        .send()
+        .await?
+        .json::<serde_json::Value>()
+        .await?;
+    
+    let mut devices = Vec::new();
+    
+    if let Some(device_list) = response["devices"].as_array() {
+        for d in device_list {
+            if d["online"].as_bool() == Some(true) {
+                if let (Some(device_id), Some(address)) = (
+                    d["device_id"].as_str(),
+                    d["address"].as_str()
+                ) {
+                    // Parse address:port from the address field
+                    let parts: Vec<&str> = address.split(':').collect();
+                    if parts.len() >= 2 {
+                        if let Ok(port) = parts[1].parse::<u16>() {
+                            devices.push(Device {
+                                device_id: device_id.to_string(),
+                                device_type: "agent".to_string(),
+                                address: parts[0].to_string(),
+                                port,
+                            });
+                        }
+                    }
+                }
+            }
+        }
+    }
+    
+    println!("Server returned {} online devices", devices.len());
     Ok(devices)
 }
 
