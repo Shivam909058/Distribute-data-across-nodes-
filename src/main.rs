@@ -314,9 +314,10 @@ async fn register_with_server(device_id: &str) -> Result<()> {
 
 async fn start_mdns_advertise(device_id: String) -> Result<()> {
     let port = get_listen_port();
+    let local_ip = get_local_ip();
+    
     tokio::spawn(async move {
         let mdns = ServiceDaemon::new().expect("Failed to create mDNS daemon");
-        let local_ip = get_local_ip();
         
         let service_type = "_vishwarupa._tcp.local.";
         let instance_name = format!("vishwarupa-{}", &device_id[..8]);
