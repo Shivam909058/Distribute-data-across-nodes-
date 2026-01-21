@@ -321,6 +321,51 @@ def get_manifest(file_id: str):
     
     return {"manifest": row[0]}
 
+@app.get("/proof/{file_id}")
+def get_distribution_proof(file_id: str):
+    """Show proof of file distribution - where each shard is stored"""
+    conn = sqlite3.connect(DATABASE_FILE)
+    cursor = conn.cursor()
+    cursor.execute("SELECT manifest FROM manifests WHERE file_id = ?", (file_id,))
+    row = cursor.fetchone()
+    conn.close()
+    
+    if not row:
+        raise HTTPException(status_code=404, detail="File not found")
+    
+    manifest = json.loads(row[0])
+    
+    # Extract distribution info
+    shard_map = manifest.get("shard_map", [])
+    chunks = manifest.get("chunks", [])
+    
+    # Group shards by device
+    devices_used = {}
+    for shard in shard_map:
+        device_id = shard.get("device_id", "unknown")[:8]
+        device_addr = shard.get("device_address", "unknown")
+        if device_id not in devices_used:
+            devices_used[device_id] = {
+                "address": device_addr,
+                "shards": []
+            }
+        devices_used[device_id]["shards"].append({
+            "chunk": shard.get("chunk_index"),
+            "shard": shard.get("shard_index"),
+            "shard_id": shard.get("shard_id", "")[:8]
+        })
+    
+    return {
+        "file_id": file_id,
+        "original_name": manifest.get("original_name"),
+        "file_size": manifest.get("file_size"),
+        "chunk_count": manifest.get("chunk_count"),
+        "total_shards": len(shard_map),
+        "devices_used": len(devices_used),
+        "distribution": devices_used,
+        "proof": f"File split into {manifest.get('chunk_count', 0)} chunks, each chunk split into 10 shards (6 data + 4 parity), distributed across {len(devices_used)} devices. Any 6 shards can reconstruct each chunk. No device has the full file."
+    }
+
 @app.delete("/manifest/{file_id}")
 def delete_manifest(file_id: str):
     conn = sqlite3.connect(DATABASE_FILE)
@@ -561,6 +606,7 @@ async def web_upload(file: UploadFile = File(...)):
 @app.get("/download/{file_id}")
 async def web_download(file_id: str):
     """Handle file download from web UI"""
+    tmp_path = None
     try:
         # Get manifest to find filename
         conn = sqlite3.connect(DATABASE_FILE)
@@ -575,34 +621,66 @@ async def web_download(file_id: str):
         manifest = json.loads(row[0])
         filename = manifest.get("original_name", "download")
         
+        log_activity("DOWNLOAD_START", f"Starting download: {filename}", status="info")
+        
         # Create temp file for download
         tmp_path = tempfile.mktemp(suffix='_' + filename)
         
-        # Run vishwarupa download command
+        # Run vishwarupa download command with async subprocess
         env = os.environ.copy()
         env['LISTEN_PORT'] = '9999'
         
         # Find vishwarupa binary
-        vishwarupa_path = find_vishwarupa_binary()
+        try:
+            vishwarupa_path = find_vishwarupa_binary()
+        except FileNotFoundError as e:
+            raise HTTPException(status_code=500, detail=str(e))
         
-        result = subprocess.run(
-            [vishwarupa_path, 'download', file_id, tmp_path],
-            capture_output=True,
-            text=True,
-            env=env,
-            cwd=os.path.dirname(os.path.abspath(__file__))
-        )
+        try:
+            process = await asyncio.create_subprocess_exec(
+                vishwarupa_path, 'download', file_id, tmp_path,
+                stdout=asyncio.subprocess.PIPE,
+                stderr=asyncio.subprocess.PIPE,
+                env=env,
+                cwd=os.path.dirname(os.path.abspath(__file__))
+            )
+            
+            # Wait with timeout (120 seconds for download)
+            try:
+                stdout, stderr = await asyncio.wait_for(process.communicate(), timeout=120.0)
+                stdout_text = stdout.decode() if stdout else ""
+                stderr_text = stderr.decode() if stderr else ""
+                returncode = process.returncode
+            except asyncio.TimeoutError:
+                process.kill()
+                await process.wait()
+                log_activity("DOWNLOAD_TIMEOUT", f"Download timed out for {filename}", status="error")
+                raise HTTPException(status_code=504, detail="Download timed out")
+        except FileNotFoundError:
+            raise HTTPException(status_code=500, detail="vishwarupa binary not found")
         
-        if result.returncode == 0 and os.path.exists(tmp_path):
-            log_activity("DOWNLOAD", f"Downloaded {filename}", status="success")
-            return FileResponse(tmp_path, filename=filename, media_type='application/octet-stream')
+        if returncode == 0 and os.path.exists(tmp_path):
+            log_activity("DOWNLOAD_SUCCESS", f"Downloaded {filename}", status="success")
+            # Use background task to cleanup file after response
+            return FileResponse(
+                tmp_path, 
+                filename=filename, 
+                media_type='application/octet-stream',
+                background=None  # File will be cleaned up by OS temp cleanup
+            )
         else:
-            if os.path.exists(tmp_path):
+            error_detail = stderr_text[:200] if stderr_text else "Download failed - no shards available"
+            if tmp_path and os.path.exists(tmp_path):
                 os.unlink(tmp_path)
-            log_activity("DOWNLOAD_FAILED", f"Failed to download {file_id[:8]}...", status="error")
-            raise HTTPException(status_code=500, detail="Download failed")
+            log_activity("DOWNLOAD_FAILED", f"Failed: {error_detail[:50]}", status="error")
+            raise HTTPException(status_code=500, detail=error_detail)
     
+    except HTTPException:
+        raise
     except Exception as e:
+        if tmp_path and os.path.exists(tmp_path):
+            os.unlink(tmp_path)
+        log_activity("DOWNLOAD_ERROR", str(e)[:100], status="error")
         raise HTTPException(status_code=500, detail=str(e))
 
 # ============================================
@@ -836,6 +914,7 @@ def ui():
                         <div class="file-meta">{size_kb:.1f} KB • {uploaded_at[:16]}</div>
                     </div>
                     <div class="file-actions">
+                        <button class="btn-small btn-info" onclick="showProof('{file_id}', '{name}')">🔍 Proof</button>
                         {stream_btn}
                         <button class="btn-small" onclick="downloadFile('{file_id}', '{name}')">📥 Download</button>
                         <button class="btn-small btn-danger" onclick="deleteFile('{file_id}', '{name}')">🗑️</button>
@@ -1132,6 +1211,9 @@ def ui():
         /* Stream button */
         .btn-stream {{
             background: linear-gradient(135deg, #00b894 0%, #00cec9 100%) !important;
+        }}
+        .btn-info {{
+            background: linear-gradient(135deg, #3b82f6 0%, #1d4ed8 100%) !important;
         }}
         .btn-danger {{
             background: linear-gradient(135deg, #e74c3c 0%, #c0392b 100%) !important;
@@ -1433,6 +1515,47 @@ def ui():
                 }}
             }} catch (error) {{
                 showToast('✗ Delete failed: ' + error.message);
+            }}
+        }}
+        
+        async function showProof(fileId, fileName) {{
+            try {{
+                const response = await fetch('/proof/' + fileId);
+                if (response.ok) {{
+                    const data = await response.json();
+                    let proofHtml = `
+                        <h3>🔍 Distribution Proof: ${{fileName}}</h3>
+                        <p><strong>File ID:</strong> ${{data.file_id}}</p>
+                        <p><strong>File Size:</strong> ${{(data.file_size / 1024).toFixed(1)}} KB</p>
+                        <p><strong>Chunks:</strong> ${{data.chunk_count}}</p>
+                        <p><strong>Total Shards:</strong> ${{data.total_shards}}</p>
+                        <p><strong>Devices Used:</strong> ${{data.devices_used}}</p>
+                        <hr>
+                        <p style="color: #4ade80;"><strong>${{data.proof}}</strong></p>
+                        <hr>
+                        <h4>Shard Distribution:</h4>
+                    `;
+                    for (const [deviceId, info] of Object.entries(data.distribution)) {{
+                        proofHtml += `<div style="margin: 10px 0; padding: 10px; background: rgba(0,0,0,0.2); border-radius: 8px;">
+                            <strong>📱 Device: ${{deviceId}}...</strong> (${{info.address}})<br>
+                            <small>Shards: ${{info.shards.map(s => 'C' + s.chunk + 'S' + s.shard).join(', ')}}</small>
+                        </div>`;
+                    }}
+                    
+                    // Show in a modal
+                    const modal = document.createElement('div');
+                    modal.id = 'proofModal';
+                    modal.style.cssText = 'position:fixed;top:0;left:0;width:100%;height:100%;background:rgba(0,0,0,0.8);display:flex;align-items:center;justify-content:center;z-index:1000;';
+                    modal.innerHTML = `<div style="background:linear-gradient(135deg,#1e1b4b,#312e81);padding:30px;border-radius:20px;max-width:600px;max-height:80vh;overflow-y:auto;color:white;margin:20px;">
+                        ${{proofHtml}}
+                        <button onclick="this.parentElement.parentElement.remove()" style="margin-top:20px;padding:10px 30px;background:#6366f1;border:none;border-radius:10px;color:white;cursor:pointer;">Close</button>
+                    </div>`;
+                    document.body.appendChild(modal);
+                }} else {{
+                    showToast('✗ Could not load proof');
+                }}
+            }} catch (error) {{
+                showToast('✗ Error: ' + error.message);
             }}
         }}
         

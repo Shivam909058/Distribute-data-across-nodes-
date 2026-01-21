@@ -260,9 +260,19 @@ fn device_id() -> String {
 }
 
 fn get_local_ip() -> String {
+    // First check for manual override via environment variable
+    if let Ok(ip) = std::env::var("LOCAL_IP") {
+        return ip;
+    }
+    
+    // Try to get local IP automatically
     local_ip_address::local_ip()
         .map(|ip| ip.to_string())
-        .unwrap_or_else(|_| "127.0.0.1".to_string())
+        .unwrap_or_else(|_| {
+            // Fallback: try to detect from network interfaces
+            eprintln!("⚠ Could not detect local IP. Set LOCAL_IP environment variable.");
+            "127.0.0.1".to_string()
+        })
 }
 
 async fn register_with_server(device_id: &str) -> Result<()> {

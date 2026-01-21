@@ -56,12 +56,29 @@ get_local_ip() {
         ip addr show 2>/dev/null | grep 'inet ' | grep -v '127.0.0.1' | head -1 | awk '{print $2}' | cut -d/ -f1
     elif command -v ifconfig &> /dev/null; then
         ifconfig 2>/dev/null | grep 'inet ' | grep -v '127.0.0.1' | head -1 | awk '{print $2}'
+    elif command -v hostname &> /dev/null; then
+        hostname -I 2>/dev/null | awk '{print $1}'
     else
-        echo "localhost"
+        echo ""
     fi
 }
 
 LOCAL_IP=$(get_local_ip)
+
+# If LOCAL_IP is empty or localhost, ask user
+if [ -z "$LOCAL_IP" ] || [ "$LOCAL_IP" = "localhost" ] || [ "$LOCAL_IP" = "127.0.0.1" ]; then
+    echo ""
+    echo "⚠ Could not detect your phone's IP address automatically."
+    echo "This IP is needed so other devices can send shards to your phone."
+    echo ""
+    echo "To find your IP: Settings → Wi-Fi → tap connected network → IP address"
+    read -p "Enter your phone's Wi-Fi IP address: " LOCAL_IP
+fi
+
+if [ -n "$LOCAL_IP" ] && [ "$LOCAL_IP" != "127.0.0.1" ]; then
+    export LOCAL_IP
+    echo "✓ Phone IP: $LOCAL_IP"
+fi
 
 # Check for laptop server URL
 if [ -z "$SERVER_URL" ]; then
