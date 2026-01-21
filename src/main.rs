@@ -348,29 +348,51 @@ async fn start_mdns_advertise(device_id: String) -> Result<()> {
 }
 
 async fn discover_devices() -> Result<Vec<Device>> {
-    let mdns = ServiceDaemon::new()?;
-    let service_type = "_vishwarupa._tcp.local.";
-    let receiver = mdns.browse(service_type)?;
+    let my_device_id = device_id();
+    let port: u16 = std::env::var("LISTEN_PORT").unwrap_or("9000".into()).parse().unwrap_or(9000);
+    let local_ip = std::env::var("LOCAL_IP").unwrap_or_else(|_| get_local_ip());
     
     let mut devices = Vec::new();
-    let timeout = tokio::time::sleep(tokio::time::Duration::from_secs(3));
-    tokio::pin!(timeout);
     
-    loop {
-        tokio::select! {
-            _ = &mut timeout => break,
-            event = receiver.recv_async() => {
-                if let Ok(event) = event {
-                    if let mdns_sd::ServiceEvent::ServiceResolved(info) = event {
-                        if let Some(device_id) = info.get_property_val_str("device_id") {
-                            for addr in info.get_addresses() {
-                                devices.push(Device {
-                                    device_id: device_id.to_string(),
-                                    device_type: "agent".to_string(),
-                                    address: addr.to_string(),
-                                    port: info.get_port(),
-                                });
-                                break;
+    // Always include self FIRST - we want to store some shards locally
+    devices.push(Device {
+        device_id: my_device_id.clone(),
+        device_type: "agent".to_string(),
+        address: local_ip.clone(),
+        port,
+    });
+    println!("Including self: {} @ {}:{}", &my_device_id[..8.min(my_device_id.len())], local_ip, port);
+    
+    // Try mDNS for other devices
+    println!("Discovering devices via mDNS...");
+    if let Ok(mdns) = ServiceDaemon::new() {
+        let service_type = "_vishwarupa._tcp.local.";
+        if let Ok(receiver) = mdns.browse(service_type) {
+            let timeout = tokio::time::sleep(tokio::time::Duration::from_secs(3));
+            tokio::pin!(timeout);
+            
+            loop {
+                tokio::select! {
+                    _ = &mut timeout => break,
+                    event = receiver.recv_async() => {
+                        if let Ok(event) = event {
+                            if let mdns_sd::ServiceEvent::ServiceResolved(info) = event {
+                                if let Some(device_id) = info.get_property_val_str("device_id") {
+                                    // Skip self (already added above)
+                                    if device_id == my_device_id {
+                                        continue;
+                                    }
+                                    for addr in info.get_addresses() {
+                                        println!("  mDNS found: {} @ {}:{}", &device_id[..8], addr, info.get_port());
+                                        devices.push(Device {
+                                            device_id: device_id.to_string(),
+                                            device_type: "agent".to_string(),
+                                            address: addr.to_string(),
+                                            port: info.get_port(),
+                                        });
+                                        break;
+                                    }
+                                }
                             }
                         }
                     }
@@ -379,15 +401,25 @@ async fn discover_devices() -> Result<Vec<Device>> {
         }
     }
     
-    // If no devices found via mDNS, try fetching from server
-    if devices.is_empty() {
-        println!("No mDNS devices found, checking server...");
-        if let Ok(server_devices) = fetch_devices_from_server().await {
-            devices = server_devices;
+    println!("mDNS found {} other devices", devices.len() - 1);
+    
+    // Always also check server for additional devices
+    println!("Checking server for devices...");
+    if let Ok(server_devices) = fetch_devices_from_server().await {
+        for sd in server_devices {
+            // Skip self and already-found devices
+            if sd.device_id == my_device_id {
+                continue;
+            }
+            let already_exists = devices.iter().any(|d| d.device_id == sd.device_id);
+            if !already_exists {
+                println!("  Server found: {} @ {}:{}", &sd.device_id[..8.min(sd.device_id.len())], sd.address, sd.port);
+                devices.push(sd);
+            }
         }
     }
     
-    println!("Discovered {} devices", devices.len());
+    println!("Total discovered: {} devices (including self)", devices.len());
     Ok(devices)
 }
 
@@ -555,7 +587,10 @@ async fn upload(path: &str, db: Arc<Database>, sync_folder: Option<String>, tags
         return Err("No devices found on network".into());
     }
     
-    println!("Found {} devices, uploading...", devices.len());
+    println!("Found {} devices for distribution:", devices.len());
+    for (i, d) in devices.iter().enumerate() {
+        println!("  [{}] {} @ {}:{}", i, &d.device_id[..8.min(d.device_id.len())], d.address, d.port);
+    }
     log_local(&format!("Discovered {} devices", devices.len()));
 
     let mut shard_map = Vec::new();
