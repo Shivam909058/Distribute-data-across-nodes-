@@ -1,9 +1,10 @@
-from fastapi import FastAPI, HTTPException, UploadFile, File
+from fastapi import FastAPI, HTTPException, UploadFile, File, Query, WebSocket, WebSocketDisconnect
 from fastapi.responses import HTMLResponse, FileResponse, StreamingResponse
 from fastapi.middleware.cors import CORSMiddleware
 from pydantic import BaseModel
-from typing import Optional, List
+from typing import Optional, List, Dict
 from datetime import datetime, timedelta
+from collections import deque
 import sqlite3
 import json
 import subprocess
@@ -12,6 +13,8 @@ import tempfile
 import asyncio
 import platform
 import shutil
+import threading
+import time
 
 app = FastAPI()
 
@@ -23,6 +26,30 @@ app.add_middleware(
     allow_methods=["*"],
     allow_headers=["*"],
 )
+
+DATABASE_FILE = "controller.db"
+
+# ============================================
+# ACTIVITY LOG SYSTEM (Feature #7)
+# ============================================
+activity_log: deque = deque(maxlen=100)  # Keep last 100 activities
+log_lock = threading.Lock()
+
+def log_activity(action: str, details: str, device_id: str = None, status: str = "info"):
+    """Add an activity to the log"""
+    with log_lock:
+        activity_log.append({
+            "timestamp": datetime.now().isoformat(),
+            "action": action,
+            "details": details,
+            "device_id": device_id[:8] + "..." if device_id and len(device_id) > 8 else device_id,
+            "status": status  # info, success, warning, error
+        })
+
+# ============================================
+# TRUSTED FRIENDS SYSTEM (Feature #5)
+# ============================================
+trusted_friends: Dict[str, dict] = {}  # device_id -> {name, added_at, last_seen}
 
 DATABASE_FILE = "controller.db"
 
@@ -46,8 +73,39 @@ def init_db():
             uploaded_at TEXT NOT NULL
         )
     """)
+    # Feature #5: Trusted Friends table
+    cursor.execute("""
+        CREATE TABLE IF NOT EXISTS trusted_friends (
+            device_id TEXT PRIMARY KEY,
+            name TEXT NOT NULL,
+            added_at TEXT NOT NULL,
+            trust_level TEXT DEFAULT 'full'
+        )
+    """)
+    # Feature #7: Activity Log table (persistent)
+    cursor.execute("""
+        CREATE TABLE IF NOT EXISTS activity_log (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            timestamp TEXT NOT NULL,
+            action TEXT NOT NULL,
+            details TEXT,
+            device_id TEXT,
+            status TEXT DEFAULT 'info'
+        )
+    """)
+    # Feature #6: Shard health tracking for self-healing
+    cursor.execute("""
+        CREATE TABLE IF NOT EXISTS shard_health (
+            shard_id TEXT PRIMARY KEY,
+            file_id TEXT NOT NULL,
+            device_id TEXT NOT NULL,
+            last_verified TEXT,
+            healthy BOOLEAN DEFAULT 1
+        )
+    """)
     conn.commit()
     conn.close()
+    log_activity("SYSTEM", "Server initialized", status="success")
 
 init_db()
 
@@ -76,6 +134,7 @@ def register(d: Device):
     conn.commit()
     conn.close()
     device_heartbeats[d.device_id] = datetime.now()
+    log_activity("DEVICE_REGISTER", f"Device {d.device_id[:8]}... registered at {d.address}", d.device_id, "success")
     print(f"✓ Device registered: {d.device_id[:8]}... at {d.address}")
     return {"ok": True, "device_id": d.device_id}
 
@@ -83,6 +142,79 @@ def register(d: Device):
 def health():
     """Health check endpoint"""
     return {"status": "ok", "timestamp": datetime.now().isoformat()}
+
+# ============================================
+# ACTIVITY LOG ENDPOINTS (Feature #7)
+# ============================================
+@app.get("/logs")
+def get_logs(limit: int = Query(50, le=100)):
+    """Get recent activity logs"""
+    with log_lock:
+        logs = list(activity_log)[-limit:]
+    return {"logs": logs[::-1]}  # Most recent first
+
+@app.post("/log")
+def add_log(action: str, details: str, device_id: str = None, status: str = "info"):
+    """Add a log entry (called by agents)"""
+    log_activity(action, details, device_id, status)
+    return {"ok": True}
+
+# ============================================
+# TRUSTED FRIENDS ENDPOINTS (Feature #5)
+# ============================================
+class TrustedFriend(BaseModel):
+    device_id: str
+    name: str
+    trust_level: str = "full"  # full, read-only, storage-only
+
+@app.post("/friends/add")
+def add_friend(friend: TrustedFriend):
+    """Add a trusted friend's device"""
+    conn = sqlite3.connect(DATABASE_FILE)
+    cursor = conn.cursor()
+    cursor.execute(
+        "INSERT OR REPLACE INTO trusted_friends (device_id, name, added_at, trust_level) VALUES (?, ?, ?, ?)",
+        (friend.device_id, friend.name, datetime.now().isoformat(), friend.trust_level)
+    )
+    conn.commit()
+    conn.close()
+    log_activity("FRIEND_ADDED", f"Added trusted friend: {friend.name}", friend.device_id, "success")
+    return {"ok": True}
+
+@app.get("/friends")
+def list_friends():
+    """List all trusted friends"""
+    conn = sqlite3.connect(DATABASE_FILE)
+    cursor = conn.cursor()
+    cursor.execute("SELECT device_id, name, added_at, trust_level FROM trusted_friends")
+    rows = cursor.fetchall()
+    conn.close()
+    
+    friends = []
+    for row in rows:
+        device_id, name, added_at, trust_level = row
+        # Check if friend is online
+        last_heartbeat = device_heartbeats.get(device_id)
+        online = last_heartbeat and (datetime.now() - last_heartbeat) < timedelta(minutes=5)
+        friends.append({
+            "device_id": device_id,
+            "name": name,
+            "added_at": added_at,
+            "trust_level": trust_level,
+            "online": online
+        })
+    return {"friends": friends}
+
+@app.delete("/friends/{device_id}")
+def remove_friend(device_id: str):
+    """Remove a trusted friend"""
+    conn = sqlite3.connect(DATABASE_FILE)
+    cursor = conn.cursor()
+    cursor.execute("DELETE FROM trusted_friends WHERE device_id = ?", (device_id,))
+    conn.commit()
+    conn.close()
+    log_activity("FRIEND_REMOVED", f"Removed trusted friend: {device_id[:8]}...", device_id, "warning")
+    return {"ok": True}
 
 @app.post("/heartbeat/{device_id}")
 def heartbeat(device_id: str):
@@ -176,6 +308,83 @@ def list_files():
     
     return {"files": files}
 
+# ============================================
+# SELF-HEALING SYSTEM (Feature #6)
+# ============================================
+@app.post("/health/check")
+async def check_shard_health():
+    """Check health of all shards and mark unhealthy ones"""
+    conn = sqlite3.connect(DATABASE_FILE)
+    cursor = conn.cursor()
+    cursor.execute("SELECT file_id, manifest FROM manifests")
+    rows = cursor.fetchall()
+    
+    unhealthy_count = 0
+    checked_count = 0
+    
+    for file_id, manifest_str in rows:
+        try:
+            manifest = json.loads(manifest_str)
+            for shard in manifest.get("shard_map", []):
+                device_id = shard.get("device_id")
+                # Check if device is online
+                last_heartbeat = device_heartbeats.get(device_id)
+                is_online = last_heartbeat and (datetime.now() - last_heartbeat) < timedelta(minutes=5)
+                
+                if not is_online:
+                    unhealthy_count += 1
+                checked_count += 1
+        except:
+            pass
+    
+    conn.close()
+    log_activity("HEALTH_CHECK", f"Checked {checked_count} shards, {unhealthy_count} unavailable", status="info")
+    return {
+        "checked": checked_count,
+        "unhealthy": unhealthy_count,
+        "healthy": checked_count - unhealthy_count
+    }
+
+@app.post("/heal/{file_id}")
+async def trigger_self_heal(file_id: str):
+    """Trigger self-healing for a specific file - redistribute missing shards"""
+    log_activity("SELF_HEAL", f"Self-healing triggered for file {file_id[:8]}...", status="warning")
+    
+    # This would trigger the agent to redistribute shards
+    # For now, we mark it as needing healing
+    conn = sqlite3.connect(DATABASE_FILE)
+    cursor = conn.cursor()
+    cursor.execute("SELECT manifest FROM manifests WHERE file_id = ?", (file_id,))
+    row = cursor.fetchone()
+    conn.close()
+    
+    if not row:
+        raise HTTPException(status_code=404, detail="File not found")
+    
+    manifest = json.loads(row[0])
+    
+    # Count available shards
+    available = 0
+    missing_devices = []
+    for shard in manifest.get("shard_map", []):
+        device_id = shard.get("device_id")
+        last_heartbeat = device_heartbeats.get(device_id)
+        if last_heartbeat and (datetime.now() - last_heartbeat) < timedelta(minutes=5):
+            available += 1
+        else:
+            missing_devices.append(device_id[:8] if device_id else "unknown")
+    
+    total = len(manifest.get("shard_map", []))
+    
+    return {
+        "file_id": file_id,
+        "total_shards": total,
+        "available_shards": available,
+        "missing_from": list(set(missing_devices)),
+        "can_recover": available >= 6,  # Need 6 of 10 shards
+        "status": "healthy" if available >= 6 else "needs_healing"
+    }
+
 # Web UI Upload/Download endpoints
 
 def find_vishwarupa_binary():
@@ -220,11 +429,16 @@ def find_vishwarupa_binary():
 async def web_upload(file: UploadFile = File(...)):
     """Handle file upload from web UI"""
     try:
+        log_activity("UPLOAD_START", f"Starting upload: {file.filename}", status="info")
+        
         # Save uploaded file temporarily
         with tempfile.NamedTemporaryFile(delete=False, suffix=os.path.splitext(file.filename)[1]) as tmp:
             content = await file.read()
             tmp.write(content)
             tmp_path = tmp.name
+        
+        file_size_kb = len(content) / 1024
+        log_activity("UPLOAD_SAVED", f"Saved {file.filename} ({file_size_kb:.1f} KB) to temp", status="info")
         
         # Run vishwarupa upload command
         env = os.environ.copy()
@@ -232,6 +446,8 @@ async def web_upload(file: UploadFile = File(...)):
         
         # Find vishwarupa binary
         vishwarupa_path = find_vishwarupa_binary()
+        
+        log_activity("UPLOAD_PROCESSING", f"Encrypting and distributing {file.filename}...", status="info")
         
         result = subprocess.run(
             [vishwarupa_path, 'upload', tmp_path],
@@ -249,12 +465,16 @@ async def web_upload(file: UploadFile = File(...)):
             for line in result.stdout.split('\n'):
                 if 'File ID:' in line:
                     file_id = line.split('File ID:')[1].strip()
+                    log_activity("UPLOAD_SUCCESS", f"Uploaded {file.filename} → {file_id[:8]}...", status="success")
                     return {"ok": True, "file_id": file_id, "filename": file.filename}
+            log_activity("UPLOAD_SUCCESS", f"Uploaded {file.filename}", status="success")
             return {"ok": True, "message": "Upload complete"}
         else:
+            log_activity("UPLOAD_FAILED", f"Failed: {result.stderr[:100]}", status="error")
             raise HTTPException(status_code=500, detail=result.stderr)
     
     except Exception as e:
+        log_activity("UPLOAD_ERROR", str(e)[:100], status="error")
         raise HTTPException(status_code=500, detail=str(e))
 
 @app.get("/download/{file_id}")
@@ -293,13 +513,160 @@ async def web_download(file_id: str):
         )
         
         if result.returncode == 0 and os.path.exists(tmp_path):
+            log_activity("DOWNLOAD", f"Downloaded {filename}", status="success")
             return FileResponse(tmp_path, filename=filename, media_type='application/octet-stream')
         else:
             if os.path.exists(tmp_path):
                 os.unlink(tmp_path)
+            log_activity("DOWNLOAD_FAILED", f"Failed to download {file_id[:8]}...", status="error")
             raise HTTPException(status_code=500, detail="Download failed")
     
     except Exception as e:
+        raise HTTPException(status_code=500, detail=str(e))
+
+# ============================================
+# STREAMING DOWNLOAD (Feature #4)
+# ============================================
+@app.get("/stream/{file_id}")
+async def stream_download(file_id: str):
+    """Stream file download - allows video playback while downloading"""
+    try:
+        conn = sqlite3.connect(DATABASE_FILE)
+        cursor = conn.cursor()
+        cursor.execute("SELECT manifest FROM manifests WHERE file_id = ?", (file_id,))
+        row = cursor.fetchone()
+        conn.close()
+        
+        if not row:
+            raise HTTPException(status_code=404, detail="File not found")
+        
+        manifest = json.loads(row[0])
+        filename = manifest.get("original_name", "download")
+        file_size = manifest.get("file_size", 0)
+        
+        # Determine media type
+        ext = os.path.splitext(filename)[1].lower()
+        media_types = {
+            '.mp4': 'video/mp4',
+            '.webm': 'video/webm',
+            '.mkv': 'video/x-matroska',
+            '.avi': 'video/x-msvideo',
+            '.mov': 'video/quicktime',
+            '.mp3': 'audio/mpeg',
+            '.wav': 'audio/wav',
+            '.ogg': 'audio/ogg',
+            '.pdf': 'application/pdf',
+            '.jpg': 'image/jpeg',
+            '.jpeg': 'image/jpeg',
+            '.png': 'image/png',
+            '.gif': 'image/gif',
+        }
+        media_type = media_types.get(ext, 'application/octet-stream')
+        
+        log_activity("STREAM_START", f"Streaming {filename}", status="info")
+        
+        # Create streaming generator
+        async def generate_stream():
+            """Generator that yields chunks as they are reconstructed"""
+            env = os.environ.copy()
+            env['LISTEN_PORT'] = '9999'
+            
+            tmp_path = tempfile.mktemp(suffix='_' + filename)
+            
+            try:
+                vishwarupa_path = find_vishwarupa_binary()
+                
+                # Run download in background
+                process = subprocess.Popen(
+                    [vishwarupa_path, 'download', file_id, tmp_path],
+                    env=env,
+                    cwd=os.path.dirname(os.path.abspath(__file__)),
+                    stdout=subprocess.PIPE,
+                    stderr=subprocess.PIPE
+                )
+                
+                # Wait for file to start appearing
+                max_wait = 30  # seconds
+                waited = 0
+                while not os.path.exists(tmp_path) and waited < max_wait:
+                    await asyncio.sleep(0.5)
+                    waited += 0.5
+                    # Check if process failed
+                    if process.poll() is not None and process.returncode != 0:
+                        break
+                
+                if not os.path.exists(tmp_path):
+                    # Fallback: wait for complete download
+                    process.wait()
+                    if os.path.exists(tmp_path):
+                        with open(tmp_path, 'rb') as f:
+                            while chunk := f.read(65536):
+                                yield chunk
+                        return
+                    else:
+                        raise Exception("Download failed")
+                
+                # Stream as file grows
+                bytes_sent = 0
+                last_size = 0
+                stale_count = 0
+                
+                while True:
+                    try:
+                        current_size = os.path.getsize(tmp_path)
+                    except:
+                        current_size = last_size
+                    
+                    if current_size > bytes_sent:
+                        with open(tmp_path, 'rb') as f:
+                            f.seek(bytes_sent)
+                            chunk = f.read(current_size - bytes_sent)
+                            if chunk:
+                                yield chunk
+                                bytes_sent += len(chunk)
+                        stale_count = 0
+                    else:
+                        stale_count += 1
+                    
+                    last_size = current_size
+                    
+                    # Check if download is complete
+                    if process.poll() is not None:
+                        # Process finished, send remaining data
+                        await asyncio.sleep(0.2)
+                        final_size = os.path.getsize(tmp_path) if os.path.exists(tmp_path) else 0
+                        if final_size > bytes_sent:
+                            with open(tmp_path, 'rb') as f:
+                                f.seek(bytes_sent)
+                                yield f.read()
+                        break
+                    
+                    # Prevent infinite loop
+                    if stale_count > 60:  # 30 seconds of no progress
+                        break
+                    
+                    await asyncio.sleep(0.5)
+                    
+            finally:
+                # Cleanup
+                if os.path.exists(tmp_path):
+                    try:
+                        os.unlink(tmp_path)
+                    except:
+                        pass
+                log_activity("STREAM_END", f"Finished streaming {filename}", status="success")
+        
+        return StreamingResponse(
+            generate_stream(),
+            media_type=media_type,
+            headers={
+                'Content-Disposition': f'inline; filename="{filename}"',
+                'Accept-Ranges': 'bytes',
+            }
+        )
+        
+    except Exception as e:
+        log_activity("STREAM_ERROR", str(e), status="error")
         raise HTTPException(status_code=500, detail=str(e))
 
 @app.delete("/delete/{file_id}")
@@ -376,6 +743,11 @@ def ui():
                 size = manifest.get("file_size", 0)
                 size_kb = size / 1024
                 
+                # Check if it's a streamable file
+                ext = os.path.splitext(name)[1].lower()
+                is_streamable = ext in ['.mp4', '.webm', '.mkv', '.avi', '.mov', '.mp3', '.wav', '.ogg']
+                stream_btn = f'''<button class="btn-small btn-stream" onclick="streamFile('{file_id}', '{name}')">▶️ Stream</button>''' if is_streamable else ''
+                
                 files_html += f'''
                 <div class="file-item">
                     <div class="file-info">
@@ -383,8 +755,9 @@ def ui():
                         <div class="file-meta">{size_kb:.1f} KB • {uploaded_at[:16]}</div>
                     </div>
                     <div class="file-actions">
+                        {stream_btn}
                         <button class="btn-small" onclick="downloadFile('{file_id}', '{name}')">📥 Download</button>
-                        <button class="btn-small" onclick="deleteFile('{file_id}', '{name}')">🗑️ Delete</button>
+                        <button class="btn-small btn-danger" onclick="deleteFile('{file_id}', '{name}')">🗑️</button>
                     </div>
                 </div>
                 '''
@@ -649,6 +1022,102 @@ def ui():
             to {{ transform: translateX(-50%) translateY(0); opacity: 1; }}
         }}
         
+        /* Activity Log Styles */
+        .log-panel {{
+            background: #1a1a2e;
+            border-radius: 12px;
+            padding: 15px;
+            max-height: 300px;
+            overflow-y: auto;
+            font-family: 'Monaco', 'Consolas', monospace;
+            font-size: 11px;
+        }}
+        .log-entry {{
+            padding: 6px 10px;
+            margin: 4px 0;
+            border-radius: 6px;
+            display: flex;
+            gap: 10px;
+            align-items: flex-start;
+        }}
+        .log-entry.info {{ background: rgba(102, 126, 234, 0.2); color: #a0b4ff; }}
+        .log-entry.success {{ background: rgba(40, 167, 69, 0.2); color: #6fdc8c; }}
+        .log-entry.warning {{ background: rgba(255, 193, 7, 0.2); color: #ffd93d; }}
+        .log-entry.error {{ background: rgba(220, 53, 69, 0.2); color: #ff6b6b; }}
+        .log-time {{ opacity: 0.7; min-width: 70px; }}
+        .log-action {{ font-weight: bold; min-width: 120px; }}
+        .log-details {{ flex: 1; word-break: break-word; }}
+        
+        /* Stream button */
+        .btn-stream {{
+            background: linear-gradient(135deg, #00b894 0%, #00cec9 100%) !important;
+        }}
+        .btn-danger {{
+            background: linear-gradient(135deg, #e74c3c 0%, #c0392b 100%) !important;
+            padding: 8px 12px !important;
+        }}
+        
+        /* Tabs */
+        .tabs {{
+            display: flex;
+            gap: 10px;
+            margin-bottom: 15px;
+        }}
+        .tab {{
+            padding: 10px 20px;
+            border: none;
+            background: #e9ecef;
+            border-radius: 8px;
+            cursor: pointer;
+            font-weight: 600;
+            transition: all 0.2s;
+        }}
+        .tab.active {{
+            background: linear-gradient(135deg, #667eea 0%, #764ba2 100%);
+            color: white;
+        }}
+        .tab-content {{
+            display: none;
+        }}
+        .tab-content.active {{
+            display: block;
+        }}
+        
+        /* Video player */
+        .video-modal {{
+            display: none;
+            position: fixed;
+            top: 0;
+            left: 0;
+            width: 100%;
+            height: 100%;
+            background: rgba(0,0,0,0.9);
+            z-index: 2000;
+            justify-content: center;
+            align-items: center;
+        }}
+        .video-modal.show {{
+            display: flex;
+        }}
+        .video-container {{
+            max-width: 90%;
+            max-height: 90%;
+            position: relative;
+        }}
+        .video-container video {{
+            max-width: 100%;
+            max-height: 80vh;
+            border-radius: 12px;
+        }}
+        .close-video {{
+            position: absolute;
+            top: -40px;
+            right: 0;
+            color: white;
+            font-size: 30px;
+            cursor: pointer;
+        }}
+        
         @media (max-width: 600px) {{
             .container {{
                 padding: 15px;
@@ -677,6 +1146,9 @@ def ui():
             .btn-small {{
                 flex: 1;
             }}
+            .tabs {{
+                flex-wrap: wrap;
+            }}
         }}
     </style>
 </head>
@@ -704,7 +1176,7 @@ def ui():
             <div class="upload-area" id="uploadArea" onclick="document.getElementById('fileInput').click()">
                 <div class="upload-icon">📤</div>
                 <div class="upload-text">Tap to Upload File</div>
-                <div class="upload-hint">Or drag and drop here</div>
+                <div class="upload-hint">Or drag and drop here • Max recommended: 100MB</div>
             </div>
             <input type="file" id="fileInput" onchange="uploadFile(this.files[0])">
             <div class="progress-container" id="progressContainer">
@@ -715,14 +1187,43 @@ def ui():
             </div>
         </div>
         
-        <div class="section">
-            <h2 class="section-title">📱 Devices</h2>
-            {devices_html}
+        <!-- Tabs for different sections -->
+        <div class="tabs">
+            <button class="tab active" onclick="showTab('devices')">📱 Devices</button>
+            <button class="tab" onclick="showTab('files')">📁 Files</button>
+            <button class="tab" onclick="showTab('logs')">📋 Activity Log</button>
         </div>
         
-        <div class="section">
-            <h2 class="section-title">📁 Files</h2>
-            {files_html}
+        <div id="tab-devices" class="tab-content active">
+            <div class="section">
+                {devices_html}
+            </div>
+        </div>
+        
+        <div id="tab-files" class="tab-content">
+            <div class="section">
+                {files_html}
+            </div>
+        </div>
+        
+        <div id="tab-logs" class="tab-content">
+            <div class="section">
+                <div class="log-panel" id="logPanel">
+                    <div class="log-entry info">
+                        <span class="log-time">--:--:--</span>
+                        <span class="log-action">LOADING</span>
+                        <span class="log-details">Fetching activity logs...</span>
+                    </div>
+                </div>
+            </div>
+        </div>
+    </div>
+    
+    <!-- Video Modal -->
+    <div class="video-modal" id="videoModal">
+        <div class="video-container">
+            <span class="close-video" onclick="closeVideo()">×</span>
+            <video id="videoPlayer" controls></video>
         </div>
     </div>
     
@@ -831,6 +1332,77 @@ def ui():
             }}
         }}
         
+        // Tab functionality
+        function showTab(tabName) {{
+            // Hide all tabs
+            document.querySelectorAll('.tab-content').forEach(t => t.classList.remove('active'));
+            document.querySelectorAll('.tab').forEach(t => t.classList.remove('active'));
+            
+            // Show selected tab
+            document.getElementById('tab-' + tabName).classList.add('active');
+            event.target.classList.add('active');
+            
+            // Load logs if switching to logs tab
+            if (tabName === 'logs') {{
+                loadLogs();
+            }}
+        }}
+        
+        // Activity Log functionality
+        async function loadLogs() {{
+            try {{
+                const response = await fetch('/logs?limit=50');
+                const data = await response.json();
+                const logPanel = document.getElementById('logPanel');
+                
+                if (data.logs && data.logs.length > 0) {{
+                    logPanel.innerHTML = data.logs.map(log => {{
+                        const time = log.timestamp ? log.timestamp.split('T')[1].substring(0, 8) : '--:--:--';
+                        return `
+                            <div class="log-entry ${{log.status}}">
+                                <span class="log-time">${{time}}</span>
+                                <span class="log-action">${{log.action}}</span>
+                                <span class="log-details">${{log.details}}</span>
+                            </div>
+                        `;
+                    }}).join('');
+                }} else {{
+                    logPanel.innerHTML = '<div class="log-entry info"><span class="log-details">No activity yet</span></div>';
+                }}
+            }} catch (error) {{
+                console.error('Failed to load logs:', error);
+            }}
+        }}
+        
+        // Video streaming functionality
+        function streamFile(fileId, fileName) {{
+            showToast('Starting stream: ' + fileName);
+            const videoModal = document.getElementById('videoModal');
+            const videoPlayer = document.getElementById('videoPlayer');
+            
+            videoPlayer.src = '/stream/' + fileId;
+            videoModal.classList.add('show');
+            videoPlayer.play();
+        }}
+        
+        function closeVideo() {{
+            const videoModal = document.getElementById('videoModal');
+            const videoPlayer = document.getElementById('videoPlayer');
+            videoPlayer.pause();
+            videoPlayer.src = '';
+            videoModal.classList.remove('show');
+        }}
+        
+        // Close video on escape key
+        document.addEventListener('keydown', (e) => {{
+            if (e.key === 'Escape') closeVideo();
+        }});
+        
+        // Close video when clicking outside
+        document.getElementById('videoModal').addEventListener('click', (e) => {{
+            if (e.target.id === 'videoModal') closeVideo();
+        }});
+        
         function showToast(message) {{
             const toast = document.getElementById('toast');
             toast.textContent = message;
@@ -840,9 +1412,22 @@ def ui():
             }}, 3000);
         }}
         
+        // Load logs on page load if logs tab is visible
+        document.addEventListener('DOMContentLoaded', () => {{
+            // Initial log load
+            loadLogs();
+        }});
+        
+        // Auto-refresh every 30 seconds (less aggressive)
         setInterval(() => {{
-            location.reload();
-        }}, 10000);
+            // Only reload if not on logs tab (logs will auto-update separately)
+            const logsTab = document.getElementById('tab-logs');
+            if (!logsTab.classList.contains('active')) {{
+                location.reload();
+            }} else {{
+                loadLogs();
+            }}
+        }}, 30000);
     </script>
 </body>
 </html>

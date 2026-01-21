@@ -69,23 +69,30 @@ fi
 echo ""
 echo "[3/5] Setting up project directory..."
 
-VISHWARUPA_DIR="$HOME/Vishwarupa"
+# Use the directory where this script is located
+SCRIPT_DIR="$(cd "$(dirname "$0")" && pwd)"
 
-if [ ! -d "$VISHWARUPA_DIR" ]; then
-    echo "Creating $VISHWARUPA_DIR"
-    mkdir -p "$VISHWARUPA_DIR"
+# Check if we're already in a project directory (has Cargo.toml)
+if [ -f "$SCRIPT_DIR/Cargo.toml" ]; then
+    VISHWARUPA_DIR="$SCRIPT_DIR"
+    echo "✓ Running from project directory: $VISHWARUPA_DIR"
+else
+    # Fallback to home directory
+    VISHWARUPA_DIR="$HOME/Vishwarupa"
+    if [ ! -d "$VISHWARUPA_DIR" ]; then
+        echo "Creating $VISHWARUPA_DIR"
+        mkdir -p "$VISHWARUPA_DIR"
+    fi
+    
+    # Copy files if script is in a different location with Cargo.toml
+    if [ "$SCRIPT_DIR" != "$VISHWARUPA_DIR" ] && [ -f "$SCRIPT_DIR/../Cargo.toml" ]; then
+        echo "Copying project files..."
+        cp -r "$SCRIPT_DIR/../"* "$VISHWARUPA_DIR/"
+    fi
 fi
 
 cd "$VISHWARUPA_DIR"
-
-# If script is run from repo root, copy files
-SCRIPT_DIR="$(cd "$(dirname "$0")" && pwd)"
-if [ "$SCRIPT_DIR" != "$VISHWARUPA_DIR" ]; then
-    if [ -f "$SCRIPT_DIR/Cargo.toml" ]; then
-        echo "Copying project files..."
-        cp -r "$SCRIPT_DIR"/* "$VISHWARUPA_DIR/"
-    fi
-fi
+echo "📂 Working in: $(pwd)"
 
 # --------------------------------------------
 # STEP 4: Build Rust agent
@@ -110,8 +117,20 @@ echo "✓ Rust agent built successfully"
 echo ""
 echo "[5/5] Setting up Python environment..."
 
+# Find Python 3 command
+if command -v python3 &> /dev/null; then
+    PYTHON_CMD="python3"
+elif command -v python &> /dev/null; then
+    PYTHON_CMD="python"
+else
+    echo "❌ Python not found!"
+    exit 1
+fi
+
+echo "Using: $PYTHON_CMD"
+
 if [ ! -d "venv" ]; then
-    python3 -m venv venv
+    $PYTHON_CMD -m venv venv
 fi
 
 source venv/bin/activate
@@ -172,9 +191,14 @@ echo ""
 echo "To start the agent:"
 echo ""
 echo "  source venv/bin/activate"
-echo "  cargo run --release"
+echo "  ./target/release/vishwarupa"
 echo ""
-echo "OR (binary exists at):"
-echo "  target/release/vishwarupa"
+echo "To start the server:"
+echo ""
+echo "  source venv/bin/activate"
+echo "  python3 server.py"
+echo ""
+echo "Or use the helper script:"
+echo "  bash start_phone.sh"
 echo ""
 echo "================================================"

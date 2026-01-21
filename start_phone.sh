@@ -5,11 +5,15 @@
 # Starts both the web server and agent on phone
 # ============================================
 
+set -e
+
 echo "🌐 Starting Vishwarupa on Phone/Tablet..."
 echo ""
 
-# Navigate to script directory
-cd "$(dirname "$0")"
+# Navigate to script directory (where this script is located)
+SCRIPT_DIR="$(cd "$(dirname "$0")" && pwd)"
+cd "$SCRIPT_DIR"
+echo "📂 Working directory: $SCRIPT_DIR"
 
 # Detect environment and source Python
 if [ -d "venv" ]; then
@@ -24,9 +28,20 @@ if [ ! -f "master_9000.key" ]; then
     echo "If this is your first device, choose a strong password."
     echo ""
     
+    # Find agent binary first
+    if [ -f "./target/release/vishwarupa" ]; then
+        TEMP_AGENT="./target/release/vishwarupa"
+    elif [ -f "./vishwarupa" ]; then
+        TEMP_AGENT="./vishwarupa"
+    else
+        TEMP_AGENT=""
+    fi
+    
     # Run agent briefly to trigger key generation
-    export LISTEN_PORT=9000
-    timeout 5 ./target/release/vishwarupa id || true
+    if [ -n "$TEMP_AGENT" ]; then
+        export LISTEN_PORT=9000
+        timeout 5 $TEMP_AGENT id 2>/dev/null || true
+    fi
     
     if [ ! -f "master_9000.key" ]; then
         echo "Generating default test key..."
@@ -63,23 +78,66 @@ fi
 
 echo ""
 echo "Starting web server on port 8000..."
-python server.py &
+
+# Find Python 3 command
+if command -v python3 &> /dev/null; then
+    PYTHON_CMD="python3"
+elif command -v python &> /dev/null; then
+    PYTHON_CMD="python"
+else
+    echo "❌ Python not found! Install with: apt install python3"
+    exit 1
+fi
+
+echo "Using: $PYTHON_CMD"
+
+# Check if server.py exists
+if [ ! -f "server.py" ]; then
+    echo "❌ server.py not found in $SCRIPT_DIR"
+    echo "Make sure you're running from the project directory"
+    exit 1
+fi
+
+# Start the server
+$PYTHON_CMD server.py &
 SERVER_PID=$!
 
 # Wait for server to be fully ready
 echo "Waiting for server to start..."
+SERVER_READY=false
 for i in {1..15}; do
     if curl -s http://localhost:8000 > /dev/null 2>&1; then
         echo "✓ Server is ready!"
+        SERVER_READY=true
         break
     fi
     sleep 1
+    echo "  Waiting... ($i/15)"
 done
+
+if [ "$SERVER_READY" = false ]; then
+    echo "⚠ Server may not have started properly"
+    echo "  Check if port 8000 is available"
+fi
 
 echo ""
 echo "Starting agent on port 9000..."
 export LISTEN_PORT=9000
-./target/release/vishwarupa &
+
+# Find the agent binary
+if [ -f "./target/release/vishwarupa" ]; then
+    AGENT_BIN="./target/release/vishwarupa"
+elif [ -f "./vishwarupa" ]; then
+    AGENT_BIN="./vishwarupa"
+else
+    echo "❌ Agent binary not found!"
+    echo "Build it first with: cargo build --release"
+    kill $SERVER_PID 2>/dev/null
+    exit 1
+fi
+
+echo "Using agent: $AGENT_BIN"
+$AGENT_BIN &
 AGENT_PID=$!
 
 # Give agent time to start

@@ -11,8 +11,33 @@ use argon2::{Argon2, PasswordHasher, password_hash::SaltString};
 use zeroize::Zeroizing;
 use rand::Rng;
 use mdns_sd::{ServiceDaemon, ServiceInfo};
+use chrono::Local;
 
 const CHUNK: usize = 4 * 1024 * 1024;
+
+// ============================================
+// LOGGING SYSTEM (Feature #7)
+// ============================================
+fn log_local(message: &str) {
+    let time = Local::now().format("%H:%M:%S");
+    println!("[{}] {}", time, message);
+}
+
+async fn log_to_server(message: &str) {
+    let server_url = get_server_url();
+    let client = reqwest::Client::new();
+    let dev_id = device_id();
+    
+    let _ = client.post(format!("{}/log", server_url))
+        .query(&[
+            ("action", message),
+            ("details", ""),
+            ("device_id", &dev_id),
+            ("status", "info"),
+        ])
+        .send()
+        .await;
+}
 
 fn get_listen_port() -> u16 {
     std::env::var("LISTEN_PORT")
@@ -24,6 +49,11 @@ fn get_listen_port() -> u16 {
 fn get_server_url() -> String {
     std::env::var("SERVER_URL")
         .unwrap_or_else(|_| "http://127.0.0.1:8000".to_string())
+}
+
+// TLS configuration flag
+fn use_tls() -> bool {
+    std::env::var("USE_TLS").unwrap_or_else(|_| "false".to_string()) == "true"
 }
 
 const DATA_SHARDS: usize = 6;
@@ -56,6 +86,16 @@ struct Manifest {
     encryption_key: Vec<u8>,
     shard_map: Vec<ShardLocation>,
     chunks: Vec<ChunkInfo>,
+    // Feature #2: Selective sync metadata
+    #[serde(default)]
+    sync_folder: Option<String>,
+    #[serde(default)]
+    tags: Vec<String>,
+    // Feature #6: Self-healing metadata
+    #[serde(default)]
+    created_at: String,
+    #[serde(default)]
+    last_verified: Option<String>,
 }
 
 #[derive(Serialize, Deserialize, Clone)]
@@ -353,13 +393,29 @@ async fn listen(db: Arc<Database>) -> Result<()> {
 }
 
 async fn handle_connection(mut stream: TcpStream, db: Arc<Database>) -> Result<()> {
-    let mut header = [0u8; 3];
+    let mut header = [0u8; 4];
     stream.read_exact(&mut header).await?;
     
-    if &header == b"GET" {
-        stream.read_exact(&mut [0u8; 1]).await?; // Read ':'
+    // Check for GET: or PING: commands
+    if &header[..3] == b"GET" || &header == b"PING" {
+        let is_ping = &header == b"PING";
+        
+        if !is_ping {
+            // GET: - already read "GET", need to skip ":"
+            // header[3] should be ':'
+        } else {
+            // PING - need to read the ":"
+            stream.read_exact(&mut [0u8; 1]).await?;
+        }
+        
         let mut shard_id = String::new();
         let mut buf = [0u8; 1];
+        
+        // For GET, skip the ':' that's in header[3]
+        if !is_ping && header[3] != b':' {
+            shard_id.push(header[3] as char);
+        }
+        
         while stream.read_exact(&mut buf).await.is_ok() {
             if buf[0] == b'\n' || buf[0] == 0 {
                 break;
@@ -368,18 +424,27 @@ async fn handle_connection(mut stream: TcpStream, db: Arc<Database>) -> Result<(
         }
         
         let shard_path = format!("{}/{}", db.storage_path(), shard_id.trim());
-        match fs::read(&shard_path) {
-            Ok(data) => {
-                stream.write_all(&data).await?;
+        
+        if is_ping {
+            // Just check if file exists
+            if std::path::Path::new(&shard_path).exists() {
+                stream.write_all(b"PONG:OK\n").await?;
+            } else {
+                stream.write_all(b"PONG:MISSING\n").await?;
             }
-            Err(_) => {
-                stream.write_all(b"ERR").await?;
+        } else {
+            match fs::read(&shard_path) {
+                Ok(data) => {
+                    stream.write_all(&data).await?;
+                }
+                Err(_) => {
+                    stream.write_all(b"ERR").await?;
+                }
             }
         }
     } else {
-        let mut len_buf = [header[0], header[1], header[2], 0];
-        stream.read_exact(&mut len_buf[3..4]).await?;
-        let meta_len = u32::from_be_bytes(len_buf) as usize;
+        // It's a shard storage request - header is first 4 bytes of length
+        let meta_len = u32::from_be_bytes(header) as usize;
         
         let mut meta_bytes = vec![0u8; meta_len];
         stream.read_exact(&mut meta_bytes).await?;
@@ -407,7 +472,7 @@ async fn handle_connection(mut stream: TcpStream, db: Arc<Database>) -> Result<(
     Ok(())
 }
 
-async fn upload(path: &str, db: Arc<Database>) -> Result<String> {
+async fn upload(path: &str, db: Arc<Database>, sync_folder: Option<String>, tags: Vec<String>) -> Result<String> {
     let file = fs::read(path)?;
     let file_size = file.len();
     let key: [u8; 32] = rand::thread_rng().gen();
@@ -418,12 +483,18 @@ async fn upload(path: &str, db: Arc<Database>) -> Result<String> {
         .unwrap_or("unknown")
         .to_string();
     
+    log_local(&format!("Starting upload: {} ({} bytes)", original_name, file_size));
+    log_to_server(&format!("upload_start: {} ({} bytes)", original_name, file_size)).await;
+    
     let devices = discover_devices().await?;
     if devices.is_empty() {
+        log_local("ERROR: No devices found on network");
+        log_to_server("upload_failed: no devices found").await;
         return Err("No devices found on network".into());
     }
     
     println!("Found {} devices, uploading...", devices.len());
+    log_local(&format!("Discovered {} devices", devices.len()));
 
     let mut shard_map = Vec::new();
     let mut chunks_info = Vec::new();
@@ -502,15 +573,20 @@ async fn upload(path: &str, db: Arc<Database>) -> Result<String> {
     
     let manifest = Manifest {
         file_id: file_id.clone(),
-        original_name,
+        original_name: original_name.clone(),
         file_size,
         chunk_count,
         encryption_key: key.to_vec(),
         shard_map,
         chunks: chunks_info,
+        sync_folder,
+        tags,
+        created_at: Local::now().format("%Y-%m-%d %H:%M:%S").to_string(),
+        last_verified: None,
     };
 
     db.store_manifest(&manifest)?;
+    log_local(&format!("Manifest stored locally for {}", original_name));
     
     // Send manifest to server so all devices can see it
     let manifest_json = serde_json::to_string(&manifest)?;
@@ -529,13 +605,22 @@ async fn upload(path: &str, db: Arc<Database>) -> Result<String> {
     };
     
     match client.post(format!("{}/manifest", server_url)).json(&request).send() {
-        Ok(_) => println!("✓ Manifest sent to server"),
-        Err(e) => eprintln!("⚠ Failed to send manifest to server: {}", e),
+        Ok(_) => {
+            println!("✓ Manifest sent to server");
+            log_local("Manifest synced to server");
+        }
+        Err(e) => {
+            eprintln!("⚠ Failed to send manifest to server: {}", e);
+            log_local(&format!("WARNING: Manifest sync failed: {}", e));
+        }
     }
     
     println!("\n✓ Upload complete!");
     println!("  File ID: {}", file_id);
     println!("  Shards stored: {}", shard_count);
+    
+    log_local(&format!("Upload complete: {} -> {} ({} shards)", original_name, file_id, shard_count));
+    log_to_server(&format!("upload_complete: {} ({} shards)", original_name, shard_count)).await;
     
     Ok(file_id)
 }
@@ -605,11 +690,15 @@ async fn fetch_manifest_from_server(file_id: &str) -> Result<Manifest> {
 }
 
 async fn download(file_id: &str, output: &str, db: Arc<Database>) -> Result<()> {
+    log_local(&format!("Starting download: {}", file_id));
+    log_to_server(&format!("download_start: {}", file_id)).await;
+    
     // Try local first, then fetch from server
     let manifest = match db.get_manifest(file_id) {
         Ok(m) => m,
         Err(_) => {
             println!("Fetching manifest from server...");
+            log_local("Fetching manifest from server");
             let m = fetch_manifest_from_server(file_id).await?;
             // Cache it locally
             let _ = db.store_manifest(&m);
@@ -686,6 +775,8 @@ async fn download(file_id: &str, output: &str, db: Arc<Database>) -> Result<()> 
     fs::write(output, &file_data)?;
     
     println!("\n✓ Download complete: {}", output);
+    log_local(&format!("Download complete: {} -> {}", manifest.original_name, output));
+    log_to_server(&format!("download_complete: {} ({} bytes)", manifest.original_name, manifest.file_size)).await;
     Ok(())
 }
 
@@ -703,6 +794,37 @@ async fn fetch_shard(addr: &str, shard_id: &str) -> Result<Vec<u8>> {
     }
     
     Ok(data)
+}
+
+async fn verify_shard_health(loc: &ShardLocation) -> Result<bool> {
+    // Try to connect to the device and check if shard exists
+    let connect_result = tokio::time::timeout(
+        tokio::time::Duration::from_secs(2),
+        TcpStream::connect(&loc.device_address)
+    ).await;
+    
+    match connect_result {
+        Ok(Ok(mut stream)) => {
+            // Send a PING request to check shard
+            let request = format!("PING:{}\n", loc.shard_id);
+            if stream.write_all(request.as_bytes()).await.is_err() {
+                return Ok(false);
+            }
+            
+            let mut response = vec![0u8; 10];
+            match tokio::time::timeout(
+                tokio::time::Duration::from_secs(2),
+                stream.read(&mut response)
+            ).await {
+                Ok(Ok(n)) if n > 0 => {
+                    let resp = String::from_utf8_lossy(&response[..n]);
+                    Ok(resp.starts_with("OK") || resp.starts_with("PONG"))
+                }
+                _ => Ok(false),
+            }
+        }
+        _ => Err("Device unreachable".into()),
+    }
 }
 
 fn encrypt_chunk(data: &[u8], key: &[u8; 32]) -> Result<(Vec<u8>, Vec<u8>)> {
@@ -749,11 +871,31 @@ async fn main() -> Result<()> {
         match args[1].as_str() {
             "upload" => {
                 if args.len() < 3 {
-                    eprintln!("Usage: vishwarupa upload <file>");
+                    eprintln!("Usage: vishwarupa upload <file> [--folder <name>] [--tags <tag1,tag2>]");
                     std::process::exit(1);
                 }
                 let db = Arc::new(Database::new(&cli_id)?);
-                let file_id = upload(&args[2], db).await?;
+                
+                // Parse optional flags
+                let mut sync_folder: Option<String> = None;
+                let mut tags: Vec<String> = Vec::new();
+                
+                let mut i = 3;
+                while i < args.len() {
+                    match args[i].as_str() {
+                        "--folder" if i + 1 < args.len() => {
+                            sync_folder = Some(args[i + 1].clone());
+                            i += 2;
+                        }
+                        "--tags" if i + 1 < args.len() => {
+                            tags = args[i + 1].split(',').map(|s| s.trim().to_string()).collect();
+                            i += 2;
+                        }
+                        _ => i += 1,
+                    }
+                }
+                
+                let file_id = upload(&args[2], db, sync_folder, tags).await?;
                 println!("File ID: {}", file_id);
             }
             "download" => {
@@ -790,8 +932,144 @@ async fn main() -> Result<()> {
                 let device_id = device_id();
                 println!("{}", device_id);
             }
+            "verify" => {
+                // Self-healing: verify shards for a file or all files
+                let db = Arc::new(Database::new(&cli_id)?);
+                let file_id = args.get(2).map(|s| s.as_str());
+                
+                let files_to_check: Vec<String> = if let Some(id) = file_id {
+                    vec![id.to_string()]
+                } else {
+                    db.list_files()?
+                };
+                
+                println!("Verifying {} file(s)...", files_to_check.len());
+                log_local(&format!("Starting verification of {} files", files_to_check.len()));
+                
+                for fid in &files_to_check {
+                    match db.get_manifest(fid) {
+                        Ok(manifest) => {
+                            println!("\nFile: {} ({})", manifest.original_name, fid);
+                            let mut healthy = 0;
+                            let mut missing = 0;
+                            
+                            for loc in &manifest.shard_map {
+                                match verify_shard_health(loc).await {
+                                    Ok(true) => healthy += 1,
+                                    Ok(false) => {
+                                        println!("  ⚠ Shard {} on {} - degraded", loc.shard_index, loc.device_id);
+                                        missing += 1;
+                                    }
+                                    Err(_) => {
+                                        println!("  ✗ Shard {} on {} - unreachable", loc.shard_index, loc.device_id);
+                                        missing += 1;
+                                    }
+                                }
+                            }
+                            
+                            let status = if missing == 0 { "HEALTHY" } else if healthy >= DATA_SHARDS { "DEGRADED" } else { "CRITICAL" };
+                            println!("  Status: {} ({}/{} shards)", status, healthy, manifest.shard_map.len());
+                            
+                            // Report to server for self-healing
+                            if missing > 0 {
+                                let client = reqwest::Client::new();
+                                let _ = client.post(format!("{}/health/report", get_server_url()))
+                                    .json(&serde_json::json!({
+                                        "file_id": fid,
+                                        "healthy_shards": healthy,
+                                        "missing_shards": missing,
+                                        "status": status
+                                    }))
+                                    .send()
+                                    .await;
+                            }
+                            
+                            log_local(&format!("Verified {}: {} ({}/{} healthy)", manifest.original_name, status, healthy, manifest.shard_map.len()));
+                        }
+                        Err(e) => {
+                            eprintln!("Cannot verify {}: {}", fid, e);
+                        }
+                    }
+                }
+                
+                log_to_server(&format!("verification_complete: {} files checked", files_to_check.len())).await;
+            }
+            "sync-folder" => {
+                // Selective sync: upload all files in a folder
+                if args.len() < 3 {
+                    eprintln!("Usage: vishwarupa sync-folder <folder_path> [--tags <tag1,tag2>]");
+                    std::process::exit(1);
+                }
+                
+                let folder_path = &args[2];
+                let folder_name = Path::new(folder_path)
+                    .file_name()
+                    .and_then(|n| n.to_str())
+                    .unwrap_or("unknown")
+                    .to_string();
+                
+                // Parse tags
+                let mut tags: Vec<String> = Vec::new();
+                if args.len() > 4 && args[3] == "--tags" {
+                    tags = args[4].split(',').map(|s| s.trim().to_string()).collect();
+                }
+                
+                let db = Arc::new(Database::new(&cli_id)?);
+                
+                // Find all files in folder
+                let pattern = format!("{}/**/*", folder_path.replace("\\", "/"));
+                let files: Vec<_> = glob::glob(&pattern)
+                    .map_err(|e| format!("Invalid glob pattern: {}", e))?
+                    .filter_map(|r| r.ok())
+                    .filter(|p| p.is_file())
+                    .collect();
+                
+                println!("Found {} files in {}", files.len(), folder_name);
+                log_local(&format!("Sync folder started: {} ({} files)", folder_name, files.len()));
+                log_to_server(&format!("sync_folder_start: {} ({} files)", folder_name, files.len())).await;
+                
+                let mut uploaded = 0;
+                let mut failed = 0;
+                
+                for file_path in files {
+                    let file_str = file_path.to_string_lossy().to_string();
+                    print!("Uploading {}... ", file_path.file_name().unwrap_or_default().to_string_lossy());
+                    
+                    match upload(&file_str, Arc::clone(&db), Some(folder_name.clone()), tags.clone()).await {
+                        Ok(file_id) => {
+                            println!("✓ ({})", &file_id[..8]);
+                            uploaded += 1;
+                        }
+                        Err(e) => {
+                            println!("✗ ({})", e);
+                            failed += 1;
+                        }
+                    }
+                }
+                
+                println!("\nSync complete: {} uploaded, {} failed", uploaded, failed);
+                log_local(&format!("Sync folder complete: {} uploaded, {} failed", uploaded, failed));
+                log_to_server(&format!("sync_folder_complete: {} uploaded, {} failed", uploaded, failed)).await;
+            }
+            "help" => {
+                println!("Vishwarupa - Distributed Encrypted File Storage\n");
+                println!("Commands:");
+                println!("  (no args)      Start as daemon (listen for shards)");
+                println!("  upload <file> [--folder <name>] [--tags <tag1,tag2>]");
+                println!("                 Upload a file to the network");
+                println!("  download <file_id> <output>");
+                println!("                 Download a file from the network");
+                println!("  list           List all stored files");
+                println!("  devices        Show discovered devices");
+                println!("  sync-folder <path> [--tags <tag1,tag2>]");
+                println!("                 Upload all files in a folder");
+                println!("  verify [file_id]");
+                println!("                 Verify shard health (all files or specific)");
+                println!("  id             Show this device's ID");
+                println!("  help           Show this help message");
+            }
             _ => {
-                eprintln!("Commands: upload, download, list, devices, id");
+                eprintln!("Commands: upload, download, list, devices, sync-folder, verify, id, help");
                 std::process::exit(1);
             }
         }
