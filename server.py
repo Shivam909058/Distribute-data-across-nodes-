@@ -1,5 +1,6 @@
 from fastapi import FastAPI, HTTPException, UploadFile, File
 from fastapi.responses import HTMLResponse, FileResponse, StreamingResponse
+from fastapi.middleware.cors import CORSMiddleware
 from pydantic import BaseModel
 from typing import Optional, List
 from datetime import datetime, timedelta
@@ -9,8 +10,19 @@ import subprocess
 import os
 import tempfile
 import asyncio
+import platform
+import shutil
 
 app = FastAPI()
+
+# Allow cross-origin requests (for phones accessing laptop server)
+app.add_middleware(
+    CORSMiddleware,
+    allow_origins=["*"],
+    allow_credentials=True,
+    allow_methods=["*"],
+    allow_headers=["*"],
+)
 
 DATABASE_FILE = "controller.db"
 
@@ -64,7 +76,13 @@ def register(d: Device):
     conn.commit()
     conn.close()
     device_heartbeats[d.device_id] = datetime.now()
+    print(f"✓ Device registered: {d.device_id[:8]}... at {d.address}")
     return {"ok": True, "device_id": d.device_id}
+
+@app.get("/health")
+def health():
+    """Health check endpoint"""
+    return {"status": "ok", "timestamp": datetime.now().isoformat()}
 
 @app.post("/heartbeat/{device_id}")
 def heartbeat(device_id: str):
@@ -159,6 +177,45 @@ def list_files():
     return {"files": files}
 
 # Web UI Upload/Download endpoints
+
+def find_vishwarupa_binary():
+    """Find the vishwarupa binary, handling Windows, Linux, and Termux"""
+    base_dir = os.path.dirname(os.path.abspath(__file__))
+    
+    # Check common locations
+    candidates = []
+    
+    if platform.system() == 'Windows':
+        candidates = [
+            os.path.join(base_dir, 'target', 'release', 'vishwarupa.exe'),
+            os.path.join(base_dir, 'target', 'debug', 'vishwarupa.exe'),
+            'vishwarupa.exe',
+        ]
+    else:
+        # Linux / Termux / proot Ubuntu
+        candidates = [
+            os.path.join(base_dir, 'target', 'release', 'vishwarupa'),
+            os.path.join(base_dir, 'target', 'debug', 'vishwarupa'),
+            '/data/data/com.termux/files/home/Vishwarupa/target/release/vishwarupa',
+            os.path.expanduser('~/Vishwarupa/target/release/vishwarupa'),
+            'vishwarupa',
+        ]
+    
+    # Check in PATH first
+    which_result = shutil.which('vishwarupa')
+    if which_result:
+        return which_result
+    
+    # Check candidates
+    for path in candidates:
+        if os.path.isfile(path) and os.access(path, os.X_OK):
+            return path
+        # On Windows, executable bit doesn't matter
+        if platform.system() == 'Windows' and os.path.isfile(path):
+            return path
+    
+    raise FileNotFoundError("vishwarupa binary not found. Run 'cargo build --release' first.")
+
 @app.post("/upload")
 async def web_upload(file: UploadFile = File(...)):
     """Handle file upload from web UI"""
@@ -174,10 +231,7 @@ async def web_upload(file: UploadFile = File(...)):
         env['LISTEN_PORT'] = '9999'
         
         # Find vishwarupa binary
-        import shutil
-        vishwarupa_path = shutil.which('vishwarupa') or './target/release/vishwarupa'
-        if os.name == 'nt':
-            vishwarupa_path = 'target\\release\\vishwarupa.exe'
+        vishwarupa_path = find_vishwarupa_binary()
         
         result = subprocess.run(
             [vishwarupa_path, 'upload', tmp_path],
@@ -228,10 +282,7 @@ async def web_download(file_id: str):
         env['LISTEN_PORT'] = '9999'
         
         # Find vishwarupa binary
-        import shutil
-        vishwarupa_path = shutil.which('vishwarupa') or './target/release/vishwarupa'
-        if os.name == 'nt':
-            vishwarupa_path = 'target\\release\\vishwarupa.exe'
+        vishwarupa_path = find_vishwarupa_binary()
         
         result = subprocess.run(
             [vishwarupa_path, 'download', file_id, tmp_path],

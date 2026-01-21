@@ -20,6 +20,12 @@ fn get_listen_port() -> u16 {
         .and_then(|p| p.parse().ok())
         .unwrap_or(9000)
 }
+
+fn get_server_url() -> String {
+    std::env::var("SERVER_URL")
+        .unwrap_or_else(|_| "http://127.0.0.1:8000".to_string())
+}
+
 const DATA_SHARDS: usize = 6;
 const PARITY_SHARDS: usize = 4;
 
@@ -223,6 +229,7 @@ async fn register_with_server(device_id: &str) -> Result<()> {
     let client = reqwest::Client::new();
     let local_ip = get_local_ip();
     let port = get_listen_port();
+    let server_url = get_server_url();
     
     #[derive(Serialize)]
     struct RegisterDevice {
@@ -239,13 +246,13 @@ async fn register_with_server(device_id: &str) -> Result<()> {
         address: format!("{}:{}", local_ip, port),
     };
     
-    match client.post("http://127.0.0.1:8000/register")
+    match client.post(format!("{}/register", server_url))
         .json(&device)
         .send()
         .await
     {
         Ok(_) => {
-            println!("✓ Registered with server");
+            println!("✓ Registered with server at {}", server_url);
             Ok(())
         }
         Err(e) => {
@@ -508,6 +515,7 @@ async fn upload(path: &str, db: Arc<Database>) -> Result<String> {
     // Send manifest to server so all devices can see it
     let manifest_json = serde_json::to_string(&manifest)?;
     let client = reqwest::blocking::Client::new();
+    let server_url = get_server_url();
     
     #[derive(Serialize)]
     struct ManifestRequest {
@@ -520,7 +528,7 @@ async fn upload(path: &str, db: Arc<Database>) -> Result<String> {
         manifest: manifest_json,
     };
     
-    match client.post("http://127.0.0.1:8000/manifest").json(&request).send() {
+    match client.post(format!("{}/manifest", server_url)).json(&request).send() {
         Ok(_) => println!("✓ Manifest sent to server"),
         Err(e) => eprintln!("⚠ Failed to send manifest to server: {}", e),
     }
@@ -577,8 +585,37 @@ async fn send_shard(device: &Device, shard: &[u8], metadata: &ShardMetadata) -> 
     Ok(response_str.to_string())
 }
 
+async fn fetch_manifest_from_server(file_id: &str) -> Result<Manifest> {
+    let server_url = get_server_url();
+    let client = reqwest::Client::new();
+    
+    let response = client
+        .get(format!("{}/manifest/{}", server_url, file_id))
+        .send()
+        .await?
+        .json::<serde_json::Value>()
+        .await?;
+    
+    let manifest_str = response["manifest"]
+        .as_str()
+        .ok_or("No manifest in response")?;
+    
+    let manifest: Manifest = serde_json::from_str(manifest_str)?;
+    Ok(manifest)
+}
+
 async fn download(file_id: &str, output: &str, db: Arc<Database>) -> Result<()> {
-    let manifest = db.get_manifest(file_id)?;
+    // Try local first, then fetch from server
+    let manifest = match db.get_manifest(file_id) {
+        Ok(m) => m,
+        Err(_) => {
+            println!("Fetching manifest from server...");
+            let m = fetch_manifest_from_server(file_id).await?;
+            // Cache it locally
+            let _ = db.store_manifest(&m);
+            m
+        }
+    };
     let mut file_data = Vec::new();
     
     println!("Downloading: {}", manifest.original_name);
