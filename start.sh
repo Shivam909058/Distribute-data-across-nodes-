@@ -73,7 +73,8 @@ if [ "$MODE_CHOICE" = "1" ]; then
     echo ""
     echo "Starting as NETWORK HUB..."
     export LOCAL_IP
-    export SERVER_URL="http://127.0.0.1:8000"
+    # Use the LAN IP for server URL so all devices use the same address
+    export SERVER_URL="http://${LOCAL_IP}:8000"
     export LISTEN_PORT=9000
     
     # Find Python

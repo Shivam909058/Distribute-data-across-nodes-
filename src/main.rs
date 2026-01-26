@@ -262,17 +262,61 @@ fn device_id() -> String {
 fn get_local_ip() -> String {
     // First check for manual override via environment variable
     if let Ok(ip) = std::env::var("LOCAL_IP") {
+        if !ip.is_empty() && ip != "127.0.0.1" && ip != "localhost" {
+            println!("Using LOCAL_IP from environment: {}", ip);
+            return ip;
+        }
+    }
+    
+    // Try to detect the IP by connecting to the server (most reliable method)
+    // This gets the IP of the interface that can reach the server
+    if let Some(ip) = detect_ip_via_server() {
+        println!("Detected IP via server route: {}", ip);
         return ip;
     }
     
-    // Try to get local IP automatically
-    local_ip_address::local_ip()
-        .map(|ip| ip.to_string())
-        .unwrap_or_else(|_| {
-            // Fallback: try to detect from network interfaces
-            eprintln!("⚠ Could not detect local IP. Set LOCAL_IP environment variable.");
-            "127.0.0.1".to_string()
-        })
+    // Try to get local IP automatically using local_ip_address crate
+    if let Ok(ip) = local_ip_address::local_ip() {
+        let ip_str = ip.to_string();
+        if ip_str != "127.0.0.1" {
+            println!("Detected IP via local_ip_address: {}", ip_str);
+            return ip_str;
+        }
+    }
+    
+    eprintln!("⚠ Could not detect local IP. Set LOCAL_IP environment variable.");
+    eprintln!("⚠ Example: set LOCAL_IP=192.168.1.100");
+    "127.0.0.1".to_string()
+}
+
+fn detect_ip_via_server() -> Option<String> {
+    // Parse server URL to get host
+    let server_url = get_server_url();
+    let host = server_url
+        .strip_prefix("http://")
+        .or_else(|| server_url.strip_prefix("https://"))
+        .unwrap_or(&server_url)
+        .split(':')
+        .next()?;
+    
+    // Skip if server is localhost
+    if host == "127.0.0.1" || host == "localhost" {
+        return None;
+    }
+    
+    // Create a UDP socket and "connect" to the server
+    // This doesn't send any packets, just determines the route
+    use std::net::UdpSocket;
+    let socket = UdpSocket::bind("0.0.0.0:0").ok()?;
+    socket.connect((host, 8000)).ok()?;
+    let local_addr = socket.local_addr().ok()?;
+    let ip = local_addr.ip().to_string();
+    
+    if ip != "0.0.0.0" && ip != "127.0.0.1" {
+        Some(ip)
+    } else {
+        None
+    }
 }
 
 async fn register_with_server(device_id: &str) -> Result<()> {
@@ -286,7 +330,9 @@ async fn register_with_server(device_id: &str) -> Result<()> {
         device_id: String,
         device_type: String,
         capabilities: Vec<String>,
-        address: String,
+        address: String,  // Full address for backward compatibility
+        host: String,     // Separate host
+        port: u16,        // Separate port
     }
     
     let device = RegisterDevice {
@@ -294,22 +340,45 @@ async fn register_with_server(device_id: &str) -> Result<()> {
         device_type: "agent".to_string(),
         capabilities: vec!["wifi".to_string(), "internet".to_string()],
         address: format!("{}:{}", local_ip, port),
+        host: local_ip.clone(),
+        port,
     };
+    
+    println!("Registering with server: {} as {}:{}", server_url, local_ip, port);
     
     match client.post(format!("{}/register", server_url))
         .json(&device)
         .send()
         .await
     {
-        Ok(_) => {
-            println!("✓ Registered with server at {}", server_url);
+        Ok(response) => {
+            if response.status().is_success() {
+                if let Ok(body) = response.json::<serde_json::Value>().await {
+                    let registered_addr = body["registered_address"].as_str().unwrap_or("unknown");
+                    println!("✓ Registered with server at {} (address: {})", server_url, registered_addr);
+                } else {
+                    println!("✓ Registered with server at {}", server_url);
+                }
+            } else {
+                eprintln!("⚠ Server returned error: {}", response.status());
+            }
             Ok(())
         }
         Err(e) => {
             eprintln!("⚠ Server registration failed: {}", e);
+            eprintln!("  Make sure the server is running at {}", server_url);
             Ok(()) // Don't fail if server is down
         }
     }
+}
+
+async fn send_heartbeat(device_id: &str) {
+    let server_url = get_server_url();
+    let client = reqwest::Client::new();
+    
+    let _ = client.post(format!("{}/heartbeat/{}", server_url, device_id))
+        .send()
+        .await;
 }
 
 async fn start_mdns_advertise(device_id: String) -> Result<()> {
@@ -723,6 +792,19 @@ async fn upload(path: &str, db: Arc<Database>, sync_folder: Option<String>, tags
 }
 
 async fn send_shard(device: &Device, shard: &[u8], metadata: &ShardMetadata) -> Result<String> {
+    // First try direct TCP connection
+    match send_shard_direct(device, shard, metadata).await {
+        Ok(shard_id) => return Ok(shard_id),
+        Err(e) => {
+            log_local(&format!("Direct connection to {} failed: {}, trying relay...", device.device_id, e));
+        }
+    }
+    
+    // Fallback: use server relay
+    send_shard_via_relay(shard, metadata).await
+}
+
+async fn send_shard_direct(device: &Device, shard: &[u8], metadata: &ShardMetadata) -> Result<String> {
     let meta_json = serde_json::to_vec(metadata)?;
     let meta_len = meta_json.len() as u32;
     
@@ -737,13 +819,13 @@ async fn send_shard(device: &Device, shard: &[u8], metadata: &ShardMetadata) -> 
     let connect_timeout = tokio::time::timeout(
         tokio::time::Duration::from_secs(3),
         TcpStream::connect(&addr)
-    ).await.map_err(|_| "Connection timeout")??;
+    ).await.map_err(|_| format!("Connection timeout to {}", addr))??;
     
     let mut stream = connect_timeout;
     
     // Write with timeout
     tokio::time::timeout(
-        tokio::time::Duration::from_secs(5),
+        tokio::time::Duration::from_secs(10),
         stream.write_all(&payload)
     ).await.map_err(|_| "Write timeout")??;
     
@@ -760,11 +842,38 @@ async fn send_shard(device: &Device, shard: &[u8], metadata: &ShardMetadata) -> 
     response.truncate(n);
     let response_str = String::from_utf8_lossy(&response);
     
-    if response_str == "ERR" {
+    if response_str == "ERR" || response_str.is_empty() {
         return Err("Remote error".into());
     }
     
     Ok(response_str.to_string())
+}
+
+async fn send_shard_via_relay(shard: &[u8], metadata: &ShardMetadata) -> Result<String> {
+    let server_url = get_server_url();
+    let client = reqwest::Client::new();
+    let shard_id = Uuid::new_v4().to_string();
+    
+    // Create combined payload: metadata + shard
+    let meta_json = serde_json::to_vec(metadata)?;
+    let meta_len = meta_json.len() as u32;
+    
+    let mut payload = Vec::new();
+    payload.extend_from_slice(&meta_len.to_be_bytes());
+    payload.extend_from_slice(&meta_json);
+    payload.extend_from_slice(shard);
+    
+    let response = client
+        .post(format!("{}/relay/shard/{}", server_url, shard_id))
+        .body(payload)
+        .send()
+        .await?;
+    
+    if response.status().is_success() {
+        Ok(shard_id)
+    } else {
+        Err(format!("Relay failed: {}", response.status()).into())
+    }
 }
 
 async fn fetch_manifest_from_server(file_id: &str) -> Result<Manifest> {
@@ -878,19 +987,61 @@ async fn download(file_id: &str, output: &str, db: Arc<Database>) -> Result<()> 
 }
 
 async fn fetch_shard(addr: &str, shard_id: &str) -> Result<Vec<u8>> {
-    let mut stream = TcpStream::connect(addr).await?;
+    // First try direct TCP connection
+    match fetch_shard_direct(addr, shard_id).await {
+        Ok(data) => return Ok(data),
+        Err(e) => {
+            log_local(&format!("Direct fetch from {} failed: {}, trying relay...", addr, e));
+        }
+    }
+    
+    // Fallback: try to get from relay
+    fetch_shard_from_relay(shard_id).await
+}
+
+async fn fetch_shard_direct(addr: &str, shard_id: &str) -> Result<Vec<u8>> {
+    let connect_result = tokio::time::timeout(
+        tokio::time::Duration::from_secs(3),
+        TcpStream::connect(addr)
+    ).await;
+    
+    let mut stream = match connect_result {
+        Ok(Ok(s)) => s,
+        Ok(Err(e)) => return Err(format!("Connection failed: {}", e).into()),
+        Err(_) => return Err("Connection timeout".into()),
+    };
     
     let request = format!("GET:{}\n", shard_id);
     stream.write_all(request.as_bytes()).await?;
     
     let mut data = Vec::new();
-    stream.read_to_end(&mut data).await?;
+    tokio::time::timeout(
+        tokio::time::Duration::from_secs(30),
+        stream.read_to_end(&mut data)
+    ).await.map_err(|_| "Read timeout")??;
     
-    if data == b"ERR" {
+    if data == b"ERR" || data.is_empty() {
         return Err("Shard not found".into());
     }
     
     Ok(data)
+}
+
+async fn fetch_shard_from_relay(shard_id: &str) -> Result<Vec<u8>> {
+    let server_url = get_server_url();
+    let client = reqwest::Client::new();
+    
+    let response = client
+        .get(format!("{}/relay/shard/{}", server_url, shard_id))
+        .send()
+        .await?;
+    
+    if response.status().is_success() {
+        let data = response.bytes().await?;
+        Ok(data.to_vec())
+    } else {
+        Err(format!("Relay fetch failed: {}", response.status()).into())
+    }
 }
 
 async fn verify_shard_health(loc: &ShardLocation) -> Result<bool> {
@@ -949,15 +1100,24 @@ async fn main() -> Result<()> {
     
     if args.len() == 1 {
         // Daemon mode - needs database
-        let device_id = device_id();
-        let db = Arc::new(Database::new(&device_id)?);
-        println!("Device: {}", device_id);
+        let dev_id = device_id();
+        let db = Arc::new(Database::new(&dev_id)?);
+        println!("Device: {}", dev_id);
         
         // Register with server
-        register_with_server(&device_id).await?;
+        register_with_server(&dev_id).await?;
         
         // Start mDNS
-        start_mdns_advertise(device_id).await?;
+        start_mdns_advertise(dev_id.clone()).await?;
+        
+        // Start heartbeat background task
+        let heartbeat_device_id = dev_id.clone();
+        tokio::spawn(async move {
+            loop {
+                tokio::time::sleep(tokio::time::Duration::from_secs(30)).await;
+                send_heartbeat(&heartbeat_device_id).await;
+            }
+        });
         
         listen(db).await?;
     } else {

@@ -47,7 +47,8 @@ echo.
 echo Starting as NETWORK HUB...
 echo.
 
-set "SERVER_URL=http://127.0.0.1:8000"
+REM Use the LAN IP for server URL so all devices can reach it
+set "SERVER_URL=http://%LOCAL_IP%:8000"
 set "LISTEN_PORT=9000"
 
 REM Check if agent exists
@@ -57,14 +58,14 @@ if not exist "%AGENT%" (
     cargo build --release
 )
 
-echo Starting web server...
+echo Starting web server on %LOCAL_IP%:8000...
 start "Vishwarupa-Server" cmd /c "python server.py"
 
 echo Waiting for server to start...
 timeout /t 3 /nobreak >nul
 
-echo Starting agent...
-start "Vishwarupa-Agent" cmd /k "set LISTEN_PORT=9000 && %AGENT%"
+echo Starting agent with LOCAL_IP=%LOCAL_IP%...
+start "Vishwarupa-Agent" cmd /k "set LOCAL_IP=%LOCAL_IP%&& set SERVER_URL=%SERVER_URL%&& set LISTEN_PORT=9000&& %AGENT%"
 
 timeout /t 2 /nobreak >nul
 
@@ -82,6 +83,12 @@ echo      Run start.bat or ./start.sh on the other device
 echo      Choose [2] and enter: %LOCAL_IP%
 echo.
 echo   Features: Upload, Download, Stream Video, Share
+echo.
+echo ========================================================
+echo.
+echo   FIREWALL: If other devices can't connect, run as Admin:
+echo     netsh advfirewall firewall add rule name="Vishwarupa-Server" dir=in action=allow protocol=TCP localport=8000
+echo     netsh advfirewall firewall add rule name="Vishwarupa-Agent" dir=in action=allow protocol=TCP localport=9000
 echo.
 echo ========================================================
 echo.

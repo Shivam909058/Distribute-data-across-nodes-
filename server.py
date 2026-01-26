@@ -1,4 +1,4 @@
-from fastapi import FastAPI, HTTPException, UploadFile, File, Query, WebSocket, WebSocketDisconnect
+from fastapi import FastAPI, HTTPException, UploadFile, File, Query, WebSocket, WebSocketDisconnect, Request
 from fastapi.responses import HTMLResponse, FileResponse, StreamingResponse
 from fastapi.middleware.cors import CORSMiddleware
 from pydantic import BaseModel
@@ -116,27 +116,66 @@ class Device(BaseModel):
     device_id: str
     device_type: str
     capabilities: List[str]
-    address: Optional[str] = None
+    address: Optional[str] = None  # Full "host:port" or just "host"
+    host: Optional[str] = None     # Just the host/IP
+    port: int = 9000               # Port number
 
 class Manifest(BaseModel):
     file_id: str
     manifest: str
 
 @app.post("/register")
-def register(d: Device):
+def register(d: Device, request: Request):
     conn = sqlite3.connect(DATABASE_FILE)
     cursor = conn.cursor()
     registered_at = datetime.now().isoformat()
+    
+    # Normalize host and port
+    # Priority: explicit host > parsed from address > request client IP
+    host = d.host
+    port = d.port
+    
+    # If host not provided but address is, parse it
+    if not host and d.address:
+        if ":" in d.address:
+            parts = d.address.rsplit(":", 1)
+            host = parts[0]
+            try:
+                port = int(parts[1])
+            except ValueError:
+                pass
+        else:
+            host = d.address
+    
+    # Validate host - reject localhost/loopback if we can detect real IP
+    if host in ("127.0.0.1", "localhost", "::1", None, ""):
+        # Try to get real IP from request if available
+        try:
+            if request and hasattr(request, 'client') and request.client:
+                client_ip = request.client.host
+                if client_ip and client_ip not in ("127.0.0.1", "::1"):
+                    host = client_ip
+                    print(f"⚠ Device sent localhost, using client IP: {client_ip}")
+        except:
+            pass
+    
+    # Still no valid host? Use what we have
+    if not host:
+        host = "127.0.0.1"
+    
+    # Store full address as "host:port" for backward compatibility
+    full_address = f"{host}:{port}"
+    
     cursor.execute(
         "INSERT OR REPLACE INTO devices (device_id, device_type, capabilities, address, registered_at, online) VALUES (?, ?, ?, ?, ?, ?)",
-        (d.device_id, d.device_type, json.dumps(d.capabilities), d.address, registered_at, True)
+        (d.device_id, d.device_type, json.dumps(d.capabilities), full_address, registered_at, True)
     )
     conn.commit()
     conn.close()
     device_heartbeats[d.device_id] = datetime.now()
-    log_activity("DEVICE_REGISTER", f"Device {d.device_id[:8]}... registered at {d.address}", d.device_id, "success")
-    print(f"✓ Device registered: {d.device_id[:8]}... at {d.address}")
-    return {"ok": True, "device_id": d.device_id}
+    log_activity("DEVICE_REGISTER", f"Device {d.device_id[:8]}... registered at {full_address}", d.device_id, "success")
+    print(f"✓ Device registered: {d.device_id[:8]}... at {full_address}")
+    return {"ok": True, "device_id": d.device_id, "registered_address": full_address}
 
 @app.get("/health")
 def health():
@@ -248,6 +287,41 @@ def get_devices():
         })
     
     return {"devices": devices}
+
+@app.get("/devices/online")
+def get_online_devices():
+    """Get only online devices with their addresses"""
+    conn = sqlite3.connect(DATABASE_FILE)
+    cursor = conn.cursor()
+    cursor.execute("SELECT device_id, device_type, capabilities, address, registered_at FROM devices")
+    rows = cursor.fetchall()
+    conn.close()
+    
+    devices = []
+    timeout = timedelta(minutes=5)
+    now = datetime.now()
+    
+    for row in rows:
+        device_id, device_type, capabilities, address, registered_at = row
+        last_heartbeat = device_heartbeats.get(device_id)
+        online = last_heartbeat and (now - last_heartbeat) < timeout
+        
+        if online and address:
+            # Parse host and port from address
+            parts = address.rsplit(":", 1) if address else ["", "9000"]
+            host = parts[0] if parts else ""
+            port = int(parts[1]) if len(parts) > 1 else 9000
+            
+            devices.append({
+                "device_id": device_id,
+                "device_type": device_type,
+                "host": host,
+                "port": port,
+                "address": address,
+                "last_seen": last_heartbeat.isoformat() if last_heartbeat else None
+            })
+    
+    return {"devices": devices, "count": len(devices)}
 
 @app.get("/api/stats")
 def get_stats():
@@ -374,6 +448,82 @@ def delete_manifest(file_id: str):
     conn.commit()
     conn.close()
     return {"ok": True}
+
+# ============================================
+# RELAY SYSTEM - For devices that can't connect directly
+# ============================================
+# In-memory relay storage (for small deployments)
+# For production, consider using Redis or file-based storage
+relay_shards: Dict[str, bytes] = {}
+relay_metadata: Dict[str, dict] = {}
+RELAY_TTL_SECONDS = 300  # 5 minutes TTL for relayed shards
+
+@app.post("/relay/shard/{shard_id}")
+async def relay_store_shard(shard_id: str, request: Request):
+    """Store a shard on the hub for relay to another device"""
+    try:
+        body = await request.body()
+        if len(body) > 10 * 1024 * 1024:  # 10MB limit per shard
+            raise HTTPException(status_code=413, detail="Shard too large")
+        
+        relay_shards[shard_id] = body
+        relay_metadata[shard_id] = {
+            "stored_at": datetime.now().isoformat(),
+            "size": len(body)
+        }
+        log_activity("RELAY_STORE", f"Stored shard {shard_id[:8]}... ({len(body)} bytes)", status="info")
+        return {"ok": True, "shard_id": shard_id}
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=str(e))
+
+@app.get("/relay/shard/{shard_id}")
+async def relay_get_shard(shard_id: str):
+    """Retrieve a shard from the relay storage"""
+    if shard_id not in relay_shards:
+        raise HTTPException(status_code=404, detail="Shard not found in relay")
+    
+    log_activity("RELAY_GET", f"Retrieved shard {shard_id[:8]}...", status="info")
+    return StreamingResponse(
+        iter([relay_shards[shard_id]]),
+        media_type="application/octet-stream"
+    )
+
+@app.delete("/relay/shard/{shard_id}")
+async def relay_delete_shard(shard_id: str):
+    """Delete a shard from relay storage after successful transfer"""
+    if shard_id in relay_shards:
+        del relay_shards[shard_id]
+    if shard_id in relay_metadata:
+        del relay_metadata[shard_id]
+    return {"ok": True}
+
+@app.get("/relay/status")
+def relay_status():
+    """Get relay system status"""
+    return {
+        "shards_count": len(relay_shards),
+        "total_size": sum(len(s) for s in relay_shards.values()),
+        "shards": {k: v for k, v in relay_metadata.items()}
+    }
+
+# Cleanup old relay shards (called periodically)
+def cleanup_relay_shards():
+    """Remove expired shards from relay storage"""
+    now = datetime.now()
+    expired = []
+    for shard_id, meta in relay_metadata.items():
+        stored_at = datetime.fromisoformat(meta["stored_at"])
+        if (now - stored_at).total_seconds() > RELAY_TTL_SECONDS:
+            expired.append(shard_id)
+    
+    for shard_id in expired:
+        if shard_id in relay_shards:
+            del relay_shards[shard_id]
+        if shard_id in relay_metadata:
+            del relay_metadata[shard_id]
+    
+    if expired:
+        log_activity("RELAY_CLEANUP", f"Cleaned up {len(expired)} expired shards", status="info")
 
 @app.get("/files")
 def list_files():
