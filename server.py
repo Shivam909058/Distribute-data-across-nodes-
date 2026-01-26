@@ -452,11 +452,15 @@ def delete_manifest(file_id: str):
 # ============================================
 # RELAY SYSTEM - For devices that can't connect directly
 # ============================================
-# In-memory relay storage (for small deployments)
-# For production, consider using Redis or file-based storage
-relay_shards: Dict[str, bytes] = {}
-relay_metadata: Dict[str, dict] = {}
-RELAY_TTL_SECONDS = 300  # 5 minutes TTL for relayed shards
+# File-based relay storage for persistence
+RELAY_STORAGE_DIR = os.path.join(os.path.dirname(os.path.abspath(__file__)), "relay_shards")
+os.makedirs(RELAY_STORAGE_DIR, exist_ok=True)
+
+relay_metadata: Dict[str, dict] = {}  # In-memory metadata cache
+
+def get_relay_shard_path(shard_id: str) -> str:
+    """Get the file path for a relay shard"""
+    return os.path.join(RELAY_STORAGE_DIR, shard_id)
 
 @app.post("/relay/shard/{shard_id}")
 async def relay_store_shard(shard_id: str, request: Request):
@@ -466,7 +470,11 @@ async def relay_store_shard(shard_id: str, request: Request):
         if len(body) > 10 * 1024 * 1024:  # 10MB limit per shard
             raise HTTPException(status_code=413, detail="Shard too large")
         
-        relay_shards[shard_id] = body
+        # Store to disk for persistence
+        shard_path = get_relay_shard_path(shard_id)
+        with open(shard_path, 'wb') as f:
+            f.write(body)
+        
         relay_metadata[shard_id] = {
             "stored_at": datetime.now().isoformat(),
             "size": len(body)
@@ -474,25 +482,26 @@ async def relay_store_shard(shard_id: str, request: Request):
         log_activity("RELAY_STORE", f"Stored shard {shard_id[:8]}... ({len(body)} bytes)", status="info")
         return {"ok": True, "shard_id": shard_id}
     except Exception as e:
+        log_activity("RELAY_ERROR", f"Failed to store shard: {str(e)[:50]}", status="error")
         raise HTTPException(status_code=500, detail=str(e))
 
 @app.get("/relay/shard/{shard_id}")
 async def relay_get_shard(shard_id: str):
     """Retrieve a shard from the relay storage"""
-    if shard_id not in relay_shards:
+    shard_path = get_relay_shard_path(shard_id)
+    
+    if not os.path.exists(shard_path):
         raise HTTPException(status_code=404, detail="Shard not found in relay")
     
     log_activity("RELAY_GET", f"Retrieved shard {shard_id[:8]}...", status="info")
-    return StreamingResponse(
-        iter([relay_shards[shard_id]]),
-        media_type="application/octet-stream"
-    )
+    return FileResponse(shard_path, media_type="application/octet-stream")
 
 @app.delete("/relay/shard/{shard_id}")
 async def relay_delete_shard(shard_id: str):
     """Delete a shard from relay storage after successful transfer"""
-    if shard_id in relay_shards:
-        del relay_shards[shard_id]
+    shard_path = get_relay_shard_path(shard_id)
+    if os.path.exists(shard_path):
+        os.unlink(shard_path)
     if shard_id in relay_metadata:
         del relay_metadata[shard_id]
     return {"ok": True}
@@ -500,30 +509,33 @@ async def relay_delete_shard(shard_id: str):
 @app.get("/relay/status")
 def relay_status():
     """Get relay system status"""
+    # Count files on disk
+    shard_files = [f for f in os.listdir(RELAY_STORAGE_DIR) if not f.endswith('.meta')]
+    total_size = sum(os.path.getsize(os.path.join(RELAY_STORAGE_DIR, f)) for f in shard_files)
+    
     return {
-        "shards_count": len(relay_shards),
-        "total_size": sum(len(s) for s in relay_shards.values()),
-        "shards": {k: v for k, v in relay_metadata.items()}
+        "shards_count": len(shard_files),
+        "total_size": total_size,
+        "storage_dir": RELAY_STORAGE_DIR
     }
 
-# Cleanup old relay shards (called periodically)
-def cleanup_relay_shards():
-    """Remove expired shards from relay storage"""
-    now = datetime.now()
-    expired = []
-    for shard_id, meta in relay_metadata.items():
-        stored_at = datetime.fromisoformat(meta["stored_at"])
-        if (now - stored_at).total_seconds() > RELAY_TTL_SECONDS:
-            expired.append(shard_id)
-    
-    for shard_id in expired:
-        if shard_id in relay_shards:
-            del relay_shards[shard_id]
-        if shard_id in relay_metadata:
-            del relay_metadata[shard_id]
-    
-    if expired:
-        log_activity("RELAY_CLEANUP", f"Cleaned up {len(expired)} expired shards", status="info")
+# Load existing relay shards metadata on startup
+def load_relay_metadata():
+    """Load metadata for existing relay shards"""
+    for filename in os.listdir(RELAY_STORAGE_DIR):
+        if not filename.endswith('.meta'):
+            shard_path = os.path.join(RELAY_STORAGE_DIR, filename)
+            stat = os.stat(shard_path)
+            relay_metadata[filename] = {
+                "stored_at": datetime.fromtimestamp(stat.st_mtime).isoformat(),
+                "size": stat.st_size
+            }
+
+# Load on module import
+try:
+    load_relay_metadata()
+except:
+    pass
 
 @app.get("/files")
 def list_files():
@@ -779,12 +791,16 @@ async def web_download(file_id: str):
         # Run vishwarupa download command with async subprocess
         env = os.environ.copy()
         env['LISTEN_PORT'] = '9999'
+        # Ensure the CLI agent knows where the server is for relay fallback
+        env['SERVER_URL'] = env.get('SERVER_URL', 'http://127.0.0.1:8000')
         
         # Find vishwarupa binary
         try:
             vishwarupa_path = find_vishwarupa_binary()
         except FileNotFoundError as e:
             raise HTTPException(status_code=500, detail=str(e))
+        
+        log_activity("DOWNLOAD_EXEC", f"Running: {vishwarupa_path} download {file_id[:8]}...", status="info")
         
         try:
             process = await asyncio.create_subprocess_exec(
@@ -819,10 +835,14 @@ async def web_download(file_id: str):
                 background=None  # File will be cleaned up by OS temp cleanup
             )
         else:
-            error_detail = stderr_text[:200] if stderr_text else "Download failed - no shards available"
+            # Log full error for debugging
+            full_error = f"Return code: {returncode}\nStdout: {stdout_text[:500]}\nStderr: {stderr_text[:500]}"
+            print(f"Download failed:\n{full_error}")
+            
+            error_detail = stderr_text[:200] if stderr_text else stdout_text[:200] if stdout_text else "Download failed - no shards available"
             if tmp_path and os.path.exists(tmp_path):
                 os.unlink(tmp_path)
-            log_activity("DOWNLOAD_FAILED", f"Failed: {error_detail[:50]}", status="error")
+            log_activity("DOWNLOAD_FAILED", f"Failed: {error_detail[:100]}", status="error")
             raise HTTPException(status_code=500, detail=error_detail)
     
     except HTTPException:

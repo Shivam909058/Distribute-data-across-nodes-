@@ -854,22 +854,15 @@ async fn send_shard_via_relay(shard: &[u8], metadata: &ShardMetadata) -> Result<
     let client = reqwest::Client::new();
     let shard_id = Uuid::new_v4().to_string();
     
-    // Create combined payload: metadata + shard
-    let meta_json = serde_json::to_vec(metadata)?;
-    let meta_len = meta_json.len() as u32;
-    
-    let mut payload = Vec::new();
-    payload.extend_from_slice(&meta_len.to_be_bytes());
-    payload.extend_from_slice(&meta_json);
-    payload.extend_from_slice(shard);
-    
+    // Store just the shard data (not the metadata) - metadata is in manifest
     let response = client
         .post(format!("{}/relay/shard/{}", server_url, shard_id))
-        .body(payload)
+        .body(shard.to_vec())
         .send()
         .await?;
     
     if response.status().is_success() {
+        log_local(&format!("Shard {} stored via relay ({} bytes)", &shard_id[..8], shard.len()));
         Ok(shard_id)
     } else {
         Err(format!("Relay failed: {}", response.status()).into())
